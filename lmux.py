@@ -1216,6 +1216,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         add("split-right", self._split_right, ["<Ctrl><Shift>d"])
         add("split-down", self._split_down, ["<Ctrl><Shift>e"])
         add("split-browser-right", self._split_browser_right, ["<Ctrl><Alt>d"])
+        add("split-browser-down", self._split_browser_down, ["<Ctrl><Alt>e"])
         add("equalize", self._equalize, ["<Ctrl><Shift>0"])
 
         add("focus-left", lambda: self._focus_dir(-1, 0), ["<Alt>Left"])
@@ -1289,6 +1290,15 @@ class LmuxWindow(Gtk.ApplicationWindow):
         ws = self._current_workspace()
         if ws:
             ws.split(Gtk.Orientation.HORIZONTAL, browser_url=BrowserPane.DEFAULT_URL)
+            self._focus_active_pane_url_bar()
+
+    def _split_browser_down(self):
+        if not WEBKIT_AVAILABLE:
+            self._notify_webkit_missing()
+            return
+        ws = self._current_workspace()
+        if ws:
+            ws.split(Gtk.Orientation.VERTICAL, browser_url=BrowserPane.DEFAULT_URL)
             self._focus_active_pane_url_bar()
 
     def _new_browser_tab(self):
