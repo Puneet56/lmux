@@ -17,15 +17,6 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Vte", "3.91")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
-try:
-    gi.require_version("WebKit", "6.0")
-    from gi.repository import WebKit  # noqa: E402
-
-    WEBKIT_AVAILABLE = True
-except (ValueError, ImportError):
-    WebKit = None  # type: ignore[assignment]
-    WEBKIT_AVAILABLE = False
-
 APP_ID = "dev.lmux.Lmux"
 FONT = "monospace 11"
 SCROLLBACK = 10_000
@@ -423,146 +414,6 @@ class Pane(Gtk.Box):
         self.term.grab_focus()
 
 
-class BrowserPane(Gtk.Box):
-    """A browser pane (WebKit2GTK)."""
-
-    DEFAULT_URL = "https://duckduckgo.com"
-
-    def __init__(self, url: str | None = None, font_scale: float = 1.0, **_unused):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL)
-        if not WEBKIT_AVAILABLE:
-            raise RuntimeError(
-                "WebKit 6.0 is not available — install with: "
-                "sudo pacman -S webkitgtk-6.0"
-            )
-        self.set_hexpand(True)
-        self.set_vexpand(True)
-
-        self.cwd: str | None = None
-        self._title: str = "browser"
-        self.last_notification: str | None = None
-        self.on_changed = None
-        self.on_bell = None
-        self.on_exited = None
-        self.on_focused = None
-
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        bar.set_margin_top(2)
-        bar.set_margin_bottom(2)
-        bar.set_margin_start(4)
-        bar.set_margin_end(4)
-        bar.add_css_class("lmux-urlbar")
-
-        self.back_btn = Gtk.Button(label="‹")
-        self.back_btn.add_css_class("flat")
-        self.back_btn.set_tooltip_text("Back (Alt+Left)")
-        self.back_btn.connect("clicked", lambda _b: self._go_back())
-        bar.append(self.back_btn)
-
-        self.forward_btn = Gtk.Button(label="›")
-        self.forward_btn.add_css_class("flat")
-        self.forward_btn.set_tooltip_text("Forward (Alt+Right)")
-        self.forward_btn.connect("clicked", lambda _b: self._go_forward())
-        bar.append(self.forward_btn)
-
-        self.reload_btn = Gtk.Button(label="↻")
-        self.reload_btn.add_css_class("flat")
-        self.reload_btn.set_tooltip_text("Reload (Ctrl+R)")
-        self.reload_btn.connect("clicked", lambda _b: self.view.reload())
-        bar.append(self.reload_btn)
-
-        self.entry = Gtk.Entry()
-        self.entry.set_hexpand(True)
-        self.entry.set_placeholder_text("URL or search…")
-        self.entry.connect("activate", self._on_entry_activate)
-        bar.append(self.entry)
-
-        self.append(bar)
-
-        self.view = WebKit.WebView.new()
-        self.view.set_hexpand(True)
-        self.view.set_vexpand(True)
-        self.view.set_zoom_level(font_scale)
-        self.view.connect("notify::title", self._on_title_changed)
-        self.view.connect("notify::uri", self._on_uri_changed)
-        self.view.connect("notify::estimated-load-progress", self._on_load_progress)
-        self.append(self.view)
-
-        focus_ctrl = Gtk.EventControllerFocus.new()
-        focus_ctrl.connect("enter", self._on_focus_enter)
-        self.view.add_controller(focus_ctrl)
-
-        self.view.load_uri(url or self.DEFAULT_URL)
-
-    @property
-    def title(self) -> str:
-        return self._title or "browser"
-
-    @property
-    def uri(self) -> str:
-        return self.view.get_uri() or ""
-
-    def _go_back(self):
-        if self.view.can_go_back():
-            self.view.go_back()
-
-    def _go_forward(self):
-        if self.view.can_go_forward():
-            self.view.go_forward()
-
-    def _on_entry_activate(self, entry: Gtk.Entry):
-        text = entry.get_text().strip()
-        if not text:
-            return
-        if "://" not in text:
-            if " " not in text and "." in text:
-                text = "https://" + text
-            else:
-                from urllib.parse import quote
-
-                text = f"https://duckduckgo.com/?q={quote(text)}"
-        self.view.load_uri(text)
-
-    def _on_title_changed(self, *_):
-        self._title = self.view.get_title() or "browser"
-        if self.on_changed:
-            self.on_changed(self)
-
-    def _on_uri_changed(self, *_):
-        uri = self.view.get_uri() or ""
-        if not self.entry.has_focus():
-            self.entry.set_text(uri)
-        self.back_btn.set_sensitive(self.view.can_go_back())
-        self.forward_btn.set_sensitive(self.view.can_go_forward())
-        if self.on_changed:
-            self.on_changed(self)
-
-    def _on_load_progress(self, *_):
-        progress = self.view.get_estimated_load_progress()
-        self.reload_btn.set_label("✕" if progress < 1.0 else "↻")
-
-    def _on_focus_enter(self, _ctrl):
-        if self.on_focused:
-            self.on_focused(self)
-
-    def apply_theme(self, _cfg: dict[str, str]):
-        pass  # WebKit doesn't honor kitty.conf
-
-    def set_font_scale(self, scale: float):
-        self.view.set_zoom_level(scale)
-
-    def copy(self):
-        self.view.execute_editing_command("Copy")
-
-    def paste(self):
-        self.view.execute_editing_command("Paste")
-
-    def focus_term(self):
-        self.view.grab_focus()
-
-
-PANE_CLASSES: tuple = (Pane, BrowserPane) if WEBKIT_AVAILABLE else (Pane,)
-
 
 class TabLabel(Gtk.Box):
     """Tab label: notification dot + title. Close via Ctrl+Shift+Q."""
@@ -651,7 +502,7 @@ def _make_paned(orientation: Gtk.Orientation) -> Gtk.Paned:
 
 
 def _find_any_pane(w):
-    if isinstance(w, PANE_CLASSES):
+    if isinstance(w, Pane):
         return w
     if isinstance(w, Gtk.Paned):
         for child in (w.get_start_child(), w.get_end_child()):
@@ -678,7 +529,7 @@ class TabRoot(Gtk.Box):
         result: list = []
 
         def walk(w):
-            if isinstance(w, PANE_CLASSES):
+            if isinstance(w, Pane):
                 result.append(w)
             elif isinstance(w, Gtk.Paned):
                 for c in (w.get_start_child(), w.get_end_child()):
@@ -851,8 +702,8 @@ class Workspace:
     def tabs(self) -> list[TabRoot]:
         return list(self._tabs.keys())
 
-    def add_tab(self, cwd: str | None = None, browser_url: str | None = None):
-        pane = self._make_pane(cwd=cwd, browser_url=browser_url)
+    def add_tab(self, cwd: str | None = None):
+        pane = self._make_pane(cwd=cwd)
         tab_root = TabRoot(pane)
         tab_root.on_active_changed = self._on_active_changed
         label = TabLabel(pane.title, on_close=lambda: self._close_tab(tab_root))
@@ -863,11 +714,7 @@ class Workspace:
         self.notebook.set_current_page(self.notebook.get_n_pages() - 1)
         GLib.idle_add(pane.focus_term)
 
-    def _make_pane(self, cwd: str | None = None, browser_url: str | None = None):
-        if browser_url is not None:
-            if not WEBKIT_AVAILABLE:
-                raise RuntimeError("WebKit not installed")
-            return BrowserPane(url=browser_url, font_scale=self.font_scale)
+    def _make_pane(self, cwd: str | None = None) -> Pane:
         return Pane(cwd=cwd, theme_cfg=self.theme_cfg, font_scale=self.font_scale)
 
     def _wire_pane(self, pane: Pane, tab_root: TabRoot):
@@ -950,14 +797,12 @@ class Workspace:
         if empty:
             self._close_tab(tr)
 
-    def split(self, orientation: Gtk.Orientation, browser_url: str | None = None):
+    def split(self, orientation: Gtk.Orientation):
         tr = self.current_tab_root()
         if not tr:
             return
-        cwd = None
-        if isinstance(tr.active_pane, Pane):
-            cwd = tr.active_pane.cwd
-        new = self._make_pane(cwd=cwd, browser_url=browser_url)
+        cwd = tr.active_pane.cwd if tr.active_pane else None
+        new = self._make_pane(cwd=cwd)
         self._wire_pane(new, tr)
         tr.split(new, orientation)
 
@@ -1115,22 +960,11 @@ class LmuxWindow(Gtk.ApplicationWindow):
             row.set_notification(ws.has_bell())
             GLib.idle_add(tr.active_pane.focus_term)
 
-    def _refresh_row(self, ws: Workspace, pane):
+    def _refresh_row(self, ws: Workspace, pane: Pane):
         row = self._rows.get(ws)
         if row is None:
             return
-        if isinstance(pane, BrowserPane):
-            uri = pane.uri
-            host = ""
-            if uri:
-                try:
-                    host = urlparse(uri).hostname or uri
-                except ValueError:
-                    host = uri
-            row.set_metadata(None, None)
-            row.sub_label.set_text(f"⌬ {host}" if host else "browser")
-        else:
-            row.set_metadata(pane.cwd, git_branch(pane.cwd))
+        row.set_metadata(pane.cwd, git_branch(pane.cwd))
 
     def _on_current_pane_changed(self, ws: Workspace, pane: Pane):
         self._refresh_row(ws, pane)
@@ -1208,15 +1042,12 @@ class LmuxWindow(Gtk.ApplicationWindow):
             app.set_accels_for_action(f"win.{name}", accels)
 
         add("new-tab", self._new_tab, ["<Ctrl><Shift>t"])
-        add("new-browser", self._new_browser_tab, ["<Ctrl><Shift>b"])
         add("new-workspace", self.new_workspace, ["<Ctrl><Shift>w"])
         add("close-pane", self._close_pane, ["<Ctrl><Shift>q"])
         add("restore-tab", self._restore_closed_tab, ["<Ctrl><Shift>z"])
 
         add("split-right", self._split_right, ["<Ctrl><Shift>d"])
         add("split-down", self._split_down, ["<Ctrl><Shift>e"])
-        add("split-browser-right", self._split_browser_right, ["<Ctrl><Alt>d"])
-        add("split-browser-down", self._split_browser_down, ["<Ctrl><Alt>e"])
         add("equalize", self._equalize, ["<Ctrl><Shift>0"])
 
         add("focus-left", lambda: self._focus_dir(-1, 0), ["<Alt>Left"])
@@ -1282,49 +1113,6 @@ class LmuxWindow(Gtk.ApplicationWindow):
         ws = self._current_workspace()
         if ws:
             ws.split(Gtk.Orientation.VERTICAL)
-
-    def _split_browser_right(self):
-        if not WEBKIT_AVAILABLE:
-            self._notify_webkit_missing()
-            return
-        ws = self._current_workspace()
-        if ws:
-            ws.split(Gtk.Orientation.HORIZONTAL, browser_url=BrowserPane.DEFAULT_URL)
-            self._focus_active_pane_url_bar()
-
-    def _split_browser_down(self):
-        if not WEBKIT_AVAILABLE:
-            self._notify_webkit_missing()
-            return
-        ws = self._current_workspace()
-        if ws:
-            ws.split(Gtk.Orientation.VERTICAL, browser_url=BrowserPane.DEFAULT_URL)
-            self._focus_active_pane_url_bar()
-
-    def _new_browser_tab(self):
-        if not WEBKIT_AVAILABLE:
-            self._notify_webkit_missing()
-            return
-        ws = self._current_workspace()
-        if ws:
-            ws.add_tab(browser_url=BrowserPane.DEFAULT_URL)
-            self._focus_active_pane_url_bar()
-
-    def _focus_active_pane_url_bar(self):
-        ws = self._current_workspace()
-        if ws is None:
-            return
-        pane = ws.current_pane()
-        if isinstance(pane, BrowserPane):
-            GLib.idle_add(pane.entry.grab_focus)
-
-    def _notify_webkit_missing(self):
-        app = self.get_application()
-        if app is None:
-            return
-        notif = Gio.Notification.new("lmux — browser unavailable")
-        notif.set_body("Install webkitgtk-6.0: sudo pacman -S webkitgtk-6.0")
-        app.send_notification("lmux-no-webkit", notif)
 
     def _equalize(self):
         ws = self._current_workspace()
@@ -1403,9 +1191,6 @@ class LmuxWindow(Gtk.ApplicationWindow):
 CSS = b"""
 .lmux-bell { color: #4c8bf2; font-size: 0.9em; }
 .lmux-active-pane { box-shadow: inset 0 0 0 1px #4c8bf2; }
-.lmux-urlbar { background: alpha(@view_fg_color, 0.04); }
-.lmux-urlbar entry { min-height: 0; padding: 2px 6px; }
-.lmux-urlbar button { min-height: 0; min-width: 22px; padding: 0 4px; }
 paned > separator { min-width: 2px; min-height: 2px; }
 notebook header { padding: 0; }
 notebook header tabs { padding: 0; }
