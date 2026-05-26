@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=lmux
+Comment=Tabbed terminal with vertical workspaces and Claude Code bell
+Exec=lmux
+Icon=utilities-terminal
+Categories=System;TerminalEmulator;
+StartupNotify=true
+StartupWMClass=dev.lmux.Lmux
+Terminal=false
