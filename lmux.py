@@ -5,6 +5,7 @@ Vertical workspace sidebar + horizontal terminal tabs with splits.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from collections import deque
@@ -17,15 +18,37 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Vte", "3.91")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
-APP_ID = "dev.lmux.Lmux"
+# Dev mode (LMUX_DEV=1) isolates a working-tree run from the installed copy:
+# different APP_ID so single-instance doesn't merge with stable, different
+# state file so dev sessions don't trash the daily layout, and a window
+# title suffix so you can tell them apart at a glance.
+DEV_MODE = os.environ.get("LMUX_DEV") == "1"
+APP_ID = "dev.lmux.LmuxDev" if DEV_MODE else "dev.lmux.Lmux"
+WINDOW_TITLE = "lmux (dev)" if DEV_MODE else "lmux"
+
 FONT = "monospace 11"
 SCROLLBACK = 10_000
-SIDEBAR_WIDTH = 220
+SIDEBAR_WIDTH = 260
 URL_PATTERN = (
     r"(?:https?|ftp|file)://"
     r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+"
 )
 CLOSED_TAB_HISTORY = 16
+STATE_PATH = os.path.expanduser(
+    "~/.cache/lmux/state-dev.json" if DEV_MODE else "~/.cache/lmux/state.json"
+)
+STATE_VERSION = 1
+
+DEBUG = os.environ.get("LMUX_DEBUG") == "1"
+try:
+    CLAUDE_IDLE_SEC = float(os.environ.get("LMUX_CLAUDE_IDLE_SEC", "5"))
+except ValueError:
+    CLAUDE_IDLE_SEC = 5.0
+
+
+def dlog(*args):
+    if DEBUG:
+        print("[lmux]", *args, file=sys.stderr, flush=True)
 
 
 def parse_cwd_uri(uri: str | None) -> str | None:
@@ -223,17 +246,27 @@ class Pane(Gtk.Box):
 
         self.on_changed = None
         self.on_bell = None
+        self.on_idle = None
         self.on_exited = None
         self.on_focused = None
+
+        self._last_output_mono = 0.0
+        self._idle_tick_id: int | None = None
+        self._notified_since_output = True
+        self._last_cursor_pos: tuple[int, int] = (-1, -1)
+        self._last_branch: str | None = None
+        self._is_claude: bool = False
 
         self.term.connect("window-title-changed", self._on_wm_title)
         self.term.connect("current-directory-uri-changed", self._on_cwd_uri)
         self.term.connect("bell", self._on_bell)
         self.term.connect("child-exited", self._on_exited)
+        self.term.connect("contents-changed", self._on_contents_changed)
         try:
             self.term.connect("notification-received", self._on_notification)
-        except TypeError:
-            pass
+            dlog("connected notification-received signal")
+        except TypeError as e:
+            dlog(f"notification-received signal not available: {e}")
 
         focus_ctrl = Gtk.EventControllerFocus.new()
         focus_ctrl.connect("enter", self._on_focus_enter)
@@ -308,11 +341,18 @@ class Pane(Gtk.Box):
         self.term.set_font_scale(scale)
 
     def _poll_cwd(self) -> bool:
+        # Self-terminate if the widget has been torn down (defensive — pane
+        # shutdown should have cancelled us, but if it didn't, don't keep
+        # polling /proc for a dead pgrp every 1.2s forever).
+        if not self.term.get_realized():
+            self._cwd_poll_id = None
+            return False
         pty = self.term.get_pty()
         if pty is None:
             return True
         fd = pty.get_fd()
         if fd < 0:
+            self._cwd_poll_id = None
             return False
         try:
             pgrp = os.tcgetpgrp(fd)
@@ -324,21 +364,37 @@ class Pane(Gtk.Box):
             new = os.readlink(f"/proc/{pgrp}/cwd")
         except OSError:
             return True
-        if new and new != self.cwd:
+        cwd_changed = bool(new and new != self.cwd)
+        if cwd_changed:
             self.cwd = new
-            if self.on_changed:
-                self.on_changed(self)
+        # Branch may change without cwd changing (e.g. `git checkout` in same dir).
+        br = git_branch(self.cwd)
+        branch_changed = br != self._last_branch
+        if branch_changed:
+            self._last_branch = br
+        # Claude detection — `comm` of the foreground process group.
+        try:
+            with open(f"/proc/{pgrp}/comm") as f:
+                is_claude = "claude" in f.read()
+        except OSError:
+            is_claude = False
+        claude_changed = is_claude != self._is_claude
+        if claude_changed:
+            self._is_claude = is_claude
+        if (cwd_changed or branch_changed or claude_changed) and self.on_changed:
+            self.on_changed(self)
         return True
 
     @property
     def title(self) -> str:
-        if self._wm_title:
-            return self._wm_title
+        base = ""
         if self.cwd:
             base = os.path.basename(self.cwd.rstrip("/"))
-            if base:
-                return base
-        return "shell"
+        if self._is_claude:
+            return f"claude · {base}" if base else "claude"
+        if self._wm_title:
+            return self._wm_title
+        return base or "shell"
 
     def _on_wm_title(self, term):
         try:
@@ -361,30 +417,113 @@ class Pane(Gtk.Box):
     def _foreground_is_claude(self) -> bool:
         pty = self.term.get_pty()
         if pty is None:
+            dlog("gate: no pty")
             return False
         fd = pty.get_fd()
         if fd < 0:
+            dlog("gate: bad fd", fd)
             return False
         try:
             pgrp = os.tcgetpgrp(fd)
-        except OSError:
+        except OSError as e:
+            dlog("gate: tcgetpgrp failed", e)
             return False
         if pgrp <= 0:
+            dlog("gate: pgrp <= 0", pgrp)
             return False
         try:
             with open(f"/proc/{pgrp}/comm") as f:
                 comm = f.read().strip()
-        except OSError:
+        except OSError as e:
+            dlog("gate: comm read failed", e)
             return False
-        return "claude" in comm
+        ok = "claude" in comm
+        dlog(f"gate: pgrp={pgrp} comm={comm!r} ok={ok}")
+        return ok
 
     def _on_bell(self, term):
+        dlog("vte bell signal fired")
         if not self._foreground_is_claude():
             return
+        if self._notified_since_output:
+            dlog("bell: already notified since last output, skip")
+            return
+        self._notified_since_output = True
         if self.on_bell:
             self.on_bell(self, None, None)
 
+    def _recent_output_snippet(self, max_chars: int = 160) -> str | None:
+        """Pull a short, human-readable slice of recent terminal text for notification context."""
+        try:
+            text = self.term.get_text_format(Vte.Format.TEXT)
+        except Exception:
+            return None
+        if not text:
+            return None
+        chrome_prefixes = ("❯", "⏵", "◉", "←", "✻", "✶", "✢", "✽", "✸", "✼", "*")
+        out: list[str] = []
+        for raw in reversed(text.splitlines()):
+            ln = raw.strip()
+            if not ln:
+                continue
+            # Skip box-drawing rules and separator lines
+            if len(ln) >= 3 and sum(c in "─━═│┃┄┅┆┇┈┉" for c in ln) / len(ln) > 0.6:
+                continue
+            if ln.startswith(chrome_prefixes):
+                continue
+            # Strip leading bullet glyphs claude uses for tool results / assistant turns
+            for b in ("● ", "⎿ ", "⎿  "):
+                if ln.startswith(b):
+                    ln = ln[len(b):].lstrip()
+                    break
+            if not ln:
+                continue
+            out.append(ln)
+            if len(out) >= 4:
+                break
+        if not out:
+            return None
+        snippet = " · ".join(reversed(out))
+        if len(snippet) > max_chars:
+            snippet = snippet[: max_chars - 1].rstrip() + "…"
+        return snippet
+
+    def _on_contents_changed(self, term):
+        # VTE also fires contents-changed on focus-in/out cursor redraws. Filter
+        # those out by checking the cursor position — real PTY output moves the
+        # cursor, focus redraws do not.
+        try:
+            pos = term.get_cursor_position()
+        except Exception:
+            pos = (-1, -1)
+        if pos == self._last_cursor_pos:
+            return
+        self._last_cursor_pos = pos
+        self._last_output_mono = GLib.get_monotonic_time() / 1_000_000.0
+        self._notified_since_output = False
+        if self._idle_tick_id is None and CLAUDE_IDLE_SEC > 0:
+            self._idle_tick_id = GLib.timeout_add(1000, self._idle_tick)
+
+    def _idle_tick(self) -> bool:
+        if not self.term.get_realized():
+            self._idle_tick_id = None
+            return False
+        elapsed = GLib.get_monotonic_time() / 1_000_000.0 - self._last_output_mono
+        if elapsed < CLAUDE_IDLE_SEC:
+            return True
+        self._idle_tick_id = None
+        if self._notified_since_output:
+            return False
+        if not self._foreground_is_claude():
+            return False
+        dlog(f"idle fallback: claude quiet for {elapsed:.1f}s")
+        self._notified_since_output = True
+        if self.on_idle:
+            self.on_idle(self)
+        return False
+
     def _on_notification(self, term, summary, body):
+        dlog(f"vte notification-received summary={summary!r} body={body!r}")
         self.last_notification = body or summary or None
         if self.on_changed:
             self.on_changed(self)
@@ -394,11 +533,23 @@ class Pane(Gtk.Box):
             self.on_bell(self, summary, body)
 
     def _on_exited(self, term, status):
+        dlog(f"pane child-exited status={status}")
+        self.shutdown()
+        if self.on_exited:
+            self.on_exited(self)
+
+    def shutdown(self) -> None:
+        """Drop all GLib timer references so the Pane (and its Vte) can be gc'd.
+
+        Safe to call multiple times; safe to call after child-exited has
+        already fired (the timer ids will be None and we no-op).
+        """
         if self._cwd_poll_id:
             GLib.source_remove(self._cwd_poll_id)
             self._cwd_poll_id = None
-        if self.on_exited:
-            self.on_exited(self)
+        if self._idle_tick_id:
+            GLib.source_remove(self._idle_tick_id)
+            self._idle_tick_id = None
 
     def _on_focus_enter(self, _ctrl):
         if self.on_focused:
@@ -416,7 +567,10 @@ class Pane(Gtk.Box):
 
 
 class TabLabel(Gtk.Box):
-    """Tab label: notification dot + title. Close via Ctrl+Shift+Q."""
+    """Tab label: notification dot + title (+ split-count). Close via Ctrl+Shift+Q.
+
+    Double-click the title to rename; Enter commits, Esc cancels.
+    """
 
     def __init__(self, title: str, on_close):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -432,29 +586,106 @@ class TabLabel(Gtk.Box):
         self.label.set_max_width_chars(22)
         self.append(self.label)
 
+        self.entry = Gtk.Entry()
+        self.entry.set_max_width_chars(22)
+        self.entry.set_visible(False)
+        self.entry.add_css_class("lmux-tab-entry")
+        self.append(self.entry)
+
+        self.count_badge = Gtk.Label(label="")
+        self.count_badge.add_css_class("lmux-split-count")
+        self.count_badge.set_visible(False)
+        self.append(self.count_badge)
+
+        self.close_btn = Gtk.Button()
+        self.close_btn.set_icon_name("window-close-symbolic")
+        self.close_btn.add_css_class("lmux-tab-close")
+        self.close_btn.add_css_class("flat")
+        self.close_btn.set_valign(Gtk.Align.CENTER)
+        self.close_btn.set_tooltip_text("Close tab (Ctrl+Shift+W)")
+        if on_close is not None:
+            self.close_btn.connect("clicked", lambda _b: on_close())
+        self.append(self.close_btn)
+
+        self.on_rename = None
+
+        # Double-click → start edit. Use n_press=2 on the label.
+        click = Gtk.GestureClick.new()
+        click.set_button(1)
+        click.connect("pressed", self._on_label_click)
+        self.label.add_controller(click)
+
+        self.entry.connect("activate", self._commit_edit)
+        key = Gtk.EventControllerKey.new()
+        key.connect("key-pressed", self._on_entry_key)
+        self.entry.add_controller(key)
+        focus = Gtk.EventControllerFocus.new()
+        focus.connect("leave", lambda *_: self._cancel_edit())
+        self.entry.add_controller(focus)
+
     def set_title(self, title: str):
         self.label.set_text(title)
 
     def set_notification(self, on: bool):
         self.dot.set_visible(on)
 
+    def set_pane_count(self, n: int):
+        if n > 1:
+            self.count_badge.set_text(str(n))
+            self.count_badge.set_visible(True)
+        else:
+            self.count_badge.set_visible(False)
+
+    def _on_label_click(self, _gesture, n_press, _x, _y):
+        if n_press == 2:
+            self._start_edit()
+
+    def _start_edit(self):
+        if self.entry.get_visible():
+            return
+        self.entry.set_text(self.label.get_text())
+        self.label.set_visible(False)
+        self.entry.set_visible(True)
+        self.entry.grab_focus()
+        self.entry.select_region(0, -1)
+
+    def _commit_edit(self, *_):
+        if not self.entry.get_visible():
+            return
+        new = self.entry.get_text().strip()
+        self._finish_edit()
+        if self.on_rename:
+            self.on_rename(new)
+
+    def _cancel_edit(self):
+        if not self.entry.get_visible():
+            return
+        self._finish_edit()
+
+    def _finish_edit(self):
+        self.entry.set_visible(False)
+        self.label.set_visible(True)
+
+    def _on_entry_key(self, _ctrl, keyval, _kc, _state):
+        if keyval == Gdk.KEY_Escape:
+            self._cancel_edit()
+            return True
+        return False
+
 
 class WorkspaceRow(Gtk.ListBoxRow):
-    """Sidebar entry: name on top, cwd · branch underneath, notification dot."""
+    """Sidebar entry: name on top, cwd · branch underneath, READY chip when bell pending.
+
+    Double-click the name to rename; Enter commits, Esc cancels.
+    """
 
     def __init__(self, name: str):
         super().__init__()
-        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        outer.set_margin_top(3)
-        outer.set_margin_bottom(3)
-        outer.set_margin_start(8)
-        outer.set_margin_end(8)
-
-        self.dot = Gtk.Label(label="●")
-        self.dot.add_css_class("lmux-bell")
-        self.dot.set_visible(False)
-        self.dot.set_valign(Gtk.Align.CENTER)
-        outer.append(self.dot)
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        outer.set_margin_top(2)
+        outer.set_margin_bottom(2)
+        outer.set_margin_start(10)
+        outer.set_margin_end(10)
 
         text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
         text.set_hexpand(True)
@@ -462,17 +693,94 @@ class WorkspaceRow(Gtk.ListBoxRow):
         self.name_label = Gtk.Label(label=name)
         self.name_label.set_xalign(0)
         self.name_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.name_label.add_css_class("lmux-ws-name")
         text.append(self.name_label)
+
+        self.name_entry = Gtk.Entry()
+        self.name_entry.add_css_class("lmux-ws-entry")
+        self.name_entry.set_visible(False)
+        text.append(self.name_entry)
 
         self.sub_label = Gtk.Label(label="")
         self.sub_label.set_xalign(0)
         self.sub_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
-        self.sub_label.add_css_class("dim-label")
-        self.sub_label.add_css_class("caption")
+        self.sub_label.add_css_class("lmux-ws-sub")
         text.append(self.sub_label)
 
         outer.append(text)
+
+        self.chip = Gtk.Label(label="READY")
+        self.chip.add_css_class("lmux-chip-ready")
+        self.chip.set_visible(False)
+        self.chip.set_valign(Gtk.Align.CENTER)
+        outer.append(self.chip)
+
+        self.close_btn = Gtk.Button()
+        self.close_btn.set_icon_name("window-close-symbolic")
+        self.close_btn.add_css_class("lmux-ws-close")
+        self.close_btn.add_css_class("flat")
+        self.close_btn.set_valign(Gtk.Align.CENTER)
+        self.close_btn.set_tooltip_text("Close workspace")
+        self.close_btn.connect("clicked", lambda _b: self._on_close_clicked())
+        outer.append(self.close_btn)
+
         self.set_child(outer)
+
+        self.on_rename = None
+        self.on_close = None
+
+        click = Gtk.GestureClick.new()
+        click.set_button(1)
+        click.connect("pressed", self._on_name_click)
+        self.name_label.add_controller(click)
+
+        self.name_entry.connect("activate", self._commit_edit)
+        key = Gtk.EventControllerKey.new()
+        key.connect("key-pressed", self._on_entry_key)
+        self.name_entry.add_controller(key)
+        focus = Gtk.EventControllerFocus.new()
+        focus.connect("leave", lambda *_: self._cancel_edit())
+        self.name_entry.add_controller(focus)
+
+    def _on_name_click(self, _gesture, n_press, _x, _y):
+        if n_press == 2:
+            self.start_rename()
+
+    def start_rename(self):
+        if self.name_entry.get_visible():
+            return
+        self.name_entry.set_text(self.name_label.get_text())
+        self.name_label.set_visible(False)
+        self.name_entry.set_visible(True)
+        self.name_entry.grab_focus()
+        self.name_entry.select_region(0, -1)
+
+    def _commit_edit(self, *_):
+        if not self.name_entry.get_visible():
+            return
+        new = self.name_entry.get_text().strip()
+        self._finish_edit()
+        if self.on_rename:
+            self.on_rename(new)
+
+    def _cancel_edit(self):
+        if not self.name_entry.get_visible():
+            return
+        self._finish_edit()
+
+    def _finish_edit(self):
+        self.name_entry.set_visible(False)
+        self.name_label.set_visible(True)
+
+    def _on_entry_key(self, _ctrl, keyval, _kc, _state):
+        if keyval == Gdk.KEY_Escape:
+            self._cancel_edit()
+            return True
+        return False
+
+    def _on_close_clicked(self):
+        if self.on_close is not None:
+            self.on_close()
 
     def set_metadata(self, cwd: str | None, branch: str | None):
         base = os.path.basename(cwd.rstrip("/")) if cwd else ""
@@ -486,7 +794,67 @@ class WorkspaceRow(Gtk.ListBoxRow):
             self.sub_label.set_text("")
 
     def set_notification(self, on: bool):
-        self.dot.set_visible(on)
+        self.chip.set_visible(on)
+
+
+_SVG_SPLIT_RIGHT = b"""<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <rect x="2.5" y="3.5" width="11" height="9" rx="1.5" fill="none" stroke="#9aa3b2" stroke-width="1.3"/>
+  <line x1="8" y1="3.5" x2="8" y2="12.5" stroke="#9aa3b2" stroke-width="1.3"/>
+</svg>"""
+
+_SVG_SPLIT_DOWN = b"""<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <rect x="2.5" y="3.5" width="11" height="9" rx="1.5" fill="none" stroke="#9aa3b2" stroke-width="1.3"/>
+  <line x1="2.5" y1="8" x2="13.5" y2="8" stroke="#9aa3b2" stroke-width="1.3"/>
+</svg>"""
+
+
+def _ensure_custom_icons() -> str:
+    base = os.path.expanduser("~/.cache/lmux/icons")
+    os.makedirs(base, exist_ok=True)
+    for name, data in (("split-right.svg", _SVG_SPLIT_RIGHT),
+                       ("split-down.svg", _SVG_SPLIT_DOWN)):
+        path = os.path.join(base, name)
+        try:
+            with open(path, "rb") as f:
+                if f.read() == data:
+                    continue
+        except OSError:
+            pass
+        with open(path, "wb") as f:
+            f.write(data)
+    return base
+
+
+def _make_tab_actions() -> Gtk.Box:
+    """Build the right-aligned button row that sits at the end of the tab strip."""
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+    box.add_css_class("lmux-tab-actions")
+    box.set_valign(Gtk.Align.CENTER)
+
+    icon_dir = _ensure_custom_icons()
+    specs = [
+        ("name:tab-new-symbolic", "win.new-tab", "New tab (Ctrl+Shift+T)"),
+        (f"file:{icon_dir}/split-right.svg", "win.split-right", "Split right (Ctrl+Shift+D)"),
+        (f"file:{icon_dir}/split-down.svg", "win.split-down", "Split down (Ctrl+Shift+E)"),
+    ]
+    for ref, action, tooltip in specs:
+        btn = Gtk.Button()
+        if ref.startswith("name:"):
+            img = Gtk.Image.new_from_icon_name(ref[5:])
+        else:
+            img = Gtk.Image.new_from_file(ref[5:])
+        img.set_pixel_size(16)
+        btn.set_child(img)
+        btn.set_action_name(action)
+        btn.set_tooltip_text(tooltip)
+        btn.add_css_class("flat")
+        btn.add_css_class("lmux-tab-btn")
+        btn.set_can_focus(False)
+        box.append(btn)
+    dlog(f"made tab-actions box with {len(specs)} buttons")
+    return box
 
 
 def _make_paned(orientation: Gtk.Orientation) -> Gtk.Paned:
@@ -522,6 +890,7 @@ class TabRoot(Gtk.Box):
         self.set_vexpand(True)
         self.active_pane = pane
         self.on_active_changed = None
+        self.custom_title: str | None = None
         self.append(pane)
         self._update_active_decoration()
 
@@ -585,6 +954,13 @@ class TabRoot(Gtk.Box):
 
     def close_pane(self, pane) -> bool:
         """Return True if tab is now empty and should close."""
+        # Drop pane timers before unparenting so the dying Pane (and its Vte)
+        # can be garbage-collected. Without this the timers pin the object
+        # forever and keep polling /proc on a dead pgrp.
+        try:
+            pane.shutdown()
+        except Exception:
+            pass
         parent = pane.get_parent()
         if isinstance(parent, Gtk.Paned):
             start = parent.get_start_child()
@@ -678,14 +1054,22 @@ class Workspace:
         on_empty,
         on_current_pane_changed,
         on_bell,
+        on_idle,
+        on_bell_cleared,
         on_tab_closed,
         theme_cfg=None,
         font_scale: float = 1.0,
     ):
         self.name = name
+        # Auto-named workspaces follow the active pane's cwd. Once the user
+        # double-clicks-and-renames (or palette-renames), this flips to True
+        # and we stop overwriting it on cwd changes.
+        self.name_is_custom: bool = False
         self.on_empty = on_empty
         self.on_current_pane_changed = on_current_pane_changed
         self.on_bell = on_bell
+        self.on_idle = on_idle
+        self.on_bell_cleared = on_bell_cleared
         self.on_tab_closed = on_tab_closed
         self.theme_cfg = theme_cfg or {}
         self.font_scale = font_scale
@@ -697,7 +1081,10 @@ class Workspace:
         self.notebook.set_hexpand(True)
         self.notebook.set_vexpand(True)
         self.notebook.connect("switch-page", self._on_switch_page)
-        self.add_tab()
+        self.notebook.set_action_widget(_make_tab_actions(), Gtk.PackType.END)
+
+    def _label_title(self, tab_root: "TabRoot", pane: "Pane") -> str:
+        return tab_root.custom_title or pane.title
 
     def tabs(self) -> list[TabRoot]:
         return list(self._tabs.keys())
@@ -707,12 +1094,78 @@ class Workspace:
         tab_root = TabRoot(pane)
         tab_root.on_active_changed = self._on_active_changed
         label = TabLabel(pane.title, on_close=lambda: self._close_tab(tab_root))
+        label.on_rename = lambda new: self._rename_tab(tab_root, new)
         self._tabs[tab_root] = label
         self._wire_pane(pane, tab_root)
         self.notebook.append_page(tab_root, label)
         self.notebook.set_tab_reorderable(tab_root, True)
         self.notebook.set_current_page(self.notebook.get_n_pages() - 1)
         GLib.idle_add(pane.focus_term)
+
+    def _rename_tab(self, tab_root: TabRoot, new_title: str):
+        tab_root.custom_title = new_title or None
+        label = self._tabs.get(tab_root)
+        if label:
+            pane = tab_root.active_pane
+            label.set_title(self._label_title(tab_root, pane))
+
+    def add_tab_from_layout(self, layout: dict, custom_title: str | None = None) -> bool:
+        """Restore a tab tree from a saved layout dict. Returns False if invalid."""
+        collected: list[tuple[Pane, bool, int | None]] = []  # (pane, is_active, position)
+
+        def build(node):
+            t = node.get("type")
+            if t == "pane":
+                pane = self._make_pane(cwd=node.get("cwd"))
+                collected.append((pane, bool(node.get("active")), None))
+                return pane
+            if t == "split":
+                orient = (Gtk.Orientation.HORIZONTAL if node.get("orientation") == "h"
+                          else Gtk.Orientation.VERTICAL)
+                paned = _make_paned(orient)
+                start = build(node["start"])
+                end = build(node["end"])
+                paned.set_start_child(start)
+                paned.set_end_child(end)
+                pos = node.get("position")
+                if isinstance(pos, int) and pos > 0:
+                    GLib.idle_add(paned.set_position, pos)
+                return paned
+            return None
+
+        try:
+            root_widget = build(layout)
+        except Exception as e:
+            dlog(f"restore: bad layout: {e}")
+            return False
+        if root_widget is None or not collected:
+            return False
+
+        first_pane = collected[0][0]
+        tab_root = TabRoot(first_pane)
+        tab_root.on_active_changed = self._on_active_changed
+        tab_root.custom_title = custom_title or None
+        if root_widget is not first_pane:
+            tab_root.remove(first_pane)
+            tab_root.append(root_widget)
+
+        for pane, _is_active, _ in collected:
+            self._wire_pane(pane, tab_root)
+
+        active = next((p for p, a, _ in collected if a), first_pane)
+        tab_root.active_pane = active
+        tab_root._update_active_decoration()
+
+        label = TabLabel(
+            self._label_title(tab_root, active),
+            on_close=lambda: self._close_tab(tab_root),
+        )
+        label.on_rename = lambda new: self._rename_tab(tab_root, new)
+        label.set_pane_count(len(collected))
+        self._tabs[tab_root] = label
+        self.notebook.append_page(tab_root, label)
+        self.notebook.set_tab_reorderable(tab_root, True)
+        return True
 
     def _make_pane(self, cwd: str | None = None) -> Pane:
         return Pane(cwd=cwd, theme_cfg=self.theme_cfg, font_scale=self.font_scale)
@@ -721,19 +1174,25 @@ class Workspace:
         def changed(p):
             label = self._tabs.get(tab_root)
             if label and tab_root.active_pane is p:
-                label.set_title(p.title)
+                label.set_title(self._label_title(tab_root, p))
             if self.current_tab_root() is tab_root and tab_root.active_pane is p:
                 self.on_current_pane_changed(self, p)
 
+        def focused(p):
+            tab_root.set_active(p)
+            self.clear_bell(tab_root)
+
         pane.on_changed = changed
         pane.on_bell = lambda p, s, b: self.on_bell(self, tab_root, p, s, b)
+        pane.on_idle = lambda p: self.on_idle(self, tab_root, p)
         pane.on_exited = lambda p: self._on_pane_exit(tab_root, p)
-        pane.on_focused = lambda p: tab_root.set_active(p)
+        pane.on_focused = focused
 
     def _on_active_changed(self, tab_root: TabRoot, pane: Pane):
         label = self._tabs.get(tab_root)
         if label:
-            label.set_title(pane.title)
+            label.set_title(self._label_title(tab_root, pane))
+            label.set_pane_count(len(tab_root.panes()))
         if self.current_tab_root() is tab_root:
             self.on_current_pane_changed(self, pane)
 
@@ -741,10 +1200,20 @@ class Workspace:
         empty = tab_root.close_pane(pane)
         if empty:
             self._close_tab(tab_root)
+        else:
+            label = self._tabs.get(tab_root)
+            if label:
+                label.set_pane_count(len(tab_root.panes()))
 
     def _close_tab(self, tab_root: TabRoot):
         # Capture cwd of last-active pane for restore
         cwd = tab_root.active_pane.cwd if tab_root.active_pane else None
+        # Cancel timers on any panes still alive in this tab (split siblings).
+        for p in tab_root.panes():
+            try:
+                p.shutdown()
+            except Exception:
+                pass
         n = self.notebook.page_num(tab_root)
         if n != -1:
             self.notebook.remove_page(n)
@@ -766,6 +1235,8 @@ class Workspace:
             lbl = self._tabs.get(tab_root)
             if lbl:
                 lbl.set_notification(False)
+            if self.on_bell_cleared:
+                self.on_bell_cleared(self)
 
     def has_bell(self) -> bool:
         return bool(self._notif)
@@ -796,6 +1267,10 @@ class Workspace:
         empty = tr.close_pane(pane)
         if empty:
             self._close_tab(tr)
+        else:
+            label = self._tabs.get(tr)
+            if label:
+                label.set_pane_count(len(tr.panes()))
 
     def split(self, orientation: Gtk.Orientation):
         tr = self.current_tab_root()
@@ -805,6 +1280,9 @@ class Workspace:
         new = self._make_pane(cwd=cwd)
         self._wire_pane(new, tr)
         tr.split(new, orientation)
+        label = self._tabs.get(tr)
+        if label:
+            label.set_pane_count(len(tr.panes()))
 
     def equalize(self):
         tr = self.current_tab_root()
@@ -848,13 +1326,16 @@ class Workspace:
 
 class LmuxWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application):
-        super().__init__(application=app, title="lmux")
+        super().__init__(application=app, title=WINDOW_TITLE)
         self.set_default_size(1280, 800)
         self._ws_counter = 0
         self.workspaces: list[Workspace] = []
         self._rows: dict[Workspace, WorkspaceRow] = {}
         self._font_scale = 1.0
         self._closed_cwds: deque[str] = deque(maxlen=CLOSED_TAB_HISTORY)
+        self._flash_tick_id: int | None = None
+        self._flash_step = 0
+        self._restoring: bool = False
         self.theme = Theme(on_change=self._apply_theme_all)
 
         self.main_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -867,24 +1348,208 @@ class LmuxWindow(Gtk.ApplicationWindow):
 
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
-        self.main_paned.set_end_child(self.stack)
 
-        self.set_child(self.main_paned)
+        self.search_bar = Gtk.SearchBar()
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Search scrollback  ·  Enter older  ·  Shift+Enter newer  ·  Esc close")
+        self.search_entry.set_hexpand(True)
+        self.search_count_label = Gtk.Label(label="")
+        self.search_count_label.add_css_class("lmux-search-count")
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        search_box.append(self.search_entry)
+        search_box.append(self.search_count_label)
+        self.search_bar.set_child(search_box)
+        self.search_bar.connect_entry(self.search_entry)
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        self.search_entry.connect("activate", lambda *_: self._search_step(forward=False))
+        sk = Gtk.EventControllerKey.new()
+        sk.connect("key-pressed", self._on_search_key)
+        self.search_entry.add_controller(sk)
+        self.search_bar.connect("notify::search-mode-enabled", self._on_search_mode_changed)
+        self._search_target_pane: Pane | None = None
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.append(self.search_bar)
+        content.append(self.stack)
+        self.stack.set_vexpand(True)
+        self.main_paned.set_end_child(content)
+
+        self.overlay = Gtk.Overlay()
+        self.overlay.set_child(self.main_paned)
+        self._build_palette_overlay()
+        self.set_child(self.overlay)
+
+        self.connect("notify::is-active", self._on_is_active_changed)
+        self.connect("close-request", self._on_close_request)
 
         self._install_actions(app)
-        self.new_workspace()
+        if not self._restore_state():
+            self.new_workspace()
+        # After init/restore, make sure typing goes straight to the active pane —
+        # the focus chain through Overlay + Stack + Notebook doesn't always pick it.
+        GLib.idle_add(self._focus_current_pane)
+
+    def _focus_current_pane(self) -> bool:
+        ws = self._current_workspace()
+        if ws is not None:
+            pane = ws.current_pane()
+            if pane is not None:
+                pane.focus_term()
+        return False
+
+    def _serialize_layout(self, widget, active_pane):
+        if isinstance(widget, Pane):
+            return {
+                "type": "pane",
+                "cwd": widget.cwd,
+                "active": widget is active_pane,
+            }
+        if isinstance(widget, Gtk.Paned):
+            return {
+                "type": "split",
+                "orientation": ("h" if widget.get_orientation() == Gtk.Orientation.HORIZONTAL
+                                else "v"),
+                "position": max(1, widget.get_position()),
+                "start": self._serialize_layout(widget.get_start_child(), active_pane),
+                "end": self._serialize_layout(widget.get_end_child(), active_pane),
+            }
+        return None
+
+    def _save_state(self) -> None:
+        try:
+            workspaces_data = []
+            current_ws = self._current_workspace()
+            active_ws_index = 0
+            for i, ws in enumerate(self.workspaces):
+                if ws is current_ws:
+                    active_ws_index = i
+                tabs_data = []
+                for tr in ws.tabs():
+                    root = tr.get_first_child()
+                    layout = self._serialize_layout(root, tr.active_pane)
+                    if layout is None:
+                        continue
+                    tab_blob = {"layout": layout}
+                    if tr.custom_title:
+                        tab_blob["title"] = tr.custom_title
+                    tabs_data.append(tab_blob)
+                if not tabs_data:
+                    continue
+                workspaces_data.append({
+                    "name": ws.name,
+                    "name_is_custom": ws.name_is_custom,
+                    "active_tab_index": max(0, ws.notebook.get_current_page()),
+                    "tabs": tabs_data,
+                })
+            width = self.get_width() if self.get_width() > 0 else 1280
+            height = self.get_height() if self.get_height() > 0 else 800
+            state = {
+                "version": STATE_VERSION,
+                "window": {"width": width, "height": height},
+                "active_workspace_index": active_ws_index,
+                "workspaces": workspaces_data,
+            }
+            os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, STATE_PATH)
+            dlog(f"state saved: {len(workspaces_data)} workspaces")
+        except OSError as e:
+            dlog(f"state save failed: {e}")
+
+    def _restore_state(self) -> bool:
+        try:
+            with open(STATE_PATH, "r") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            dlog(f"no state to restore: {e}")
+            return False
+        if data.get("version") != STATE_VERSION:
+            dlog(f"state version mismatch: {data.get('version')}")
+            return False
+        wins = data.get("workspaces") or []
+        if not wins:
+            return False
+
+        win = data.get("window") or {}
+        w = int(win.get("width") or 0)
+        h = int(win.get("height") or 0)
+        if w > 200 and h > 200:
+            self.set_default_size(w, h)
+
+        self._restoring = True
+        try:
+            for ws_data in wins:
+                ws = self._make_workspace(ws_data.get("name"))
+                # Default True for backwards-compat with older state files —
+                # if we can't tell, assume the saved name was deliberate.
+                ws.name_is_custom = bool(ws_data.get("name_is_custom", True))
+                added = 0
+                for tab in ws_data.get("tabs") or []:
+                    layout = tab.get("layout")
+                    title = tab.get("title")
+                    if layout and ws.add_tab_from_layout(layout, custom_title=title):
+                        added += 1
+                if added == 0:
+                    ws.add_tab()
+                idx = ws_data.get("active_tab_index", 0)
+                if 0 <= idx < ws.notebook.get_n_pages():
+                    ws.notebook.set_current_page(idx)
+        finally:
+            self._restoring = False
+
+        active_idx = data.get("active_workspace_index", 0)
+        if 0 <= active_idx < len(self.workspaces):
+            row = self.sidebar_list.get_row_at_index(active_idx)
+            if row is not None:
+                self.sidebar_list.select_row(row)
+        dlog(f"state restored: {len(self.workspaces)} workspaces")
+        return True
+
+    def _on_close_request(self, _w) -> bool:
+        self._save_state()
+        if self._flash_tick_id is not None:
+            GLib.source_remove(self._flash_tick_id)
+            self._flash_tick_id = None
+        # Drop every pane's timer refs so the Vte widgets can be released and
+        # the GLib main loop has no remaining sources keeping the process alive.
+        for ws in self.workspaces:
+            for tr in ws.tabs():
+                for p in tr.panes():
+                    try:
+                        p.shutdown()
+                    except Exception:
+                        pass
+        return False  # allow close
+
+    def _on_is_active_changed(self, *_):
+        active = self.is_active()
+        dlog(f"window is-active changed -> {active}")
+        if not active:
+            return
+        ws = self._current_workspace()
+        if ws is None:
+            return
+        tr = ws.current_tab_root()
+        if tr is not None:
+            ws.clear_bell(tr)
+            # Pull focus back to the terminal unless an overlay surface owns it.
+            if (not self._palette_is_open()
+                    and not self.search_bar.get_search_mode()):
+                pane = tr.active_pane
+                if pane is not None:
+                    GLib.idle_add(pane.focus_term)
 
     def _build_sidebar(self) -> Gtk.Box:
         sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         sidebar.add_css_class("sidebar")
 
-        new_btn = Gtk.Button(label="+ workspace")
+        new_btn = Gtk.Button(label="+  New workspace")
+        new_btn.set_halign(Gtk.Align.FILL)
         new_btn.add_css_class("flat")
+        new_btn.add_css_class("lmux-new-ws")
         new_btn.set_tooltip_text("New workspace (Ctrl+Shift+W)")
-        new_btn.set_margin_top(4)
-        new_btn.set_margin_bottom(2)
-        new_btn.set_margin_start(6)
-        new_btn.set_margin_end(6)
         new_btn.connect("clicked", lambda _b: self.new_workspace())
         sidebar.append(new_btn)
 
@@ -910,13 +1575,36 @@ class LmuxWindow(Gtk.ApplicationWindow):
     # --- workspace management ---
 
     def new_workspace(self):
-        self._ws_counter += 1
-        name = f"ws-{self._ws_counter}"
+        self._make_workspace(None)
+
+    def _make_workspace(self, name: str | None) -> Workspace:
+        auto_name = name is None
+        if auto_name:
+            self._ws_counter += 1
+            name = f"ws-{self._ws_counter}"  # placeholder; overridden once the pane reports a cwd
+        else:
+            # Bump counter so future generated names don't collide with restored ones.
+            if name.startswith("ws-"):
+                try:
+                    n = int(name[3:])
+                    if n > self._ws_counter:
+                        self._ws_counter = n
+                except ValueError:
+                    pass
+        existing = {w.name for w in self.workspaces}
+        if name in existing:
+            base = name
+            n = 2
+            while f"{base} ({n})" in existing:
+                n += 1
+            name = f"{base} ({n})"
         ws = Workspace(
             name,
             on_empty=self._remove_workspace,
             on_current_pane_changed=self._on_current_pane_changed,
             on_bell=self._on_bell,
+            on_idle=self._on_idle,
+            on_bell_cleared=self._on_bell_cleared,
             on_tab_closed=self._on_tab_closed,
             theme_cfg=self.theme.cfg,
             font_scale=self._font_scale,
@@ -926,13 +1614,68 @@ class LmuxWindow(Gtk.ApplicationWindow):
 
         row = WorkspaceRow(name)
         row.workspace = ws  # type: ignore[attr-defined]
+        row.on_rename = lambda new, ws=ws: self._rename_workspace(ws, new)
+        row.on_close = lambda ws=ws: self._close_workspace(ws)
         self._rows[ws] = row
         self.sidebar_list.append(row)
         self.sidebar_list.select_row(row)
 
+        # Default new workspace starts with one fresh tab. Callers restoring
+        # from state add their own tabs after creation.
+        if not self._restoring:
+            ws.add_tab()
+
         pane = ws.current_pane()
         if pane is not None:
+            # If the workspace name was auto-generated, derive it from the
+            # initial pane cwd so we don't show "ws-1" briefly.
+            if auto_name and pane.cwd:
+                derived = os.path.basename(pane.cwd.rstrip("/"))
+                if derived:
+                    self._set_workspace_name(ws, derived, mark_custom=False)
             self._refresh_row(ws, pane)
+        return ws
+
+    def _rename_workspace(self, ws: Workspace, new_name: str):
+        # Manual rename — locks the workspace name against further auto-updates.
+        self._set_workspace_name(ws, new_name, mark_custom=True)
+
+    def _set_workspace_name(self, ws: Workspace, new_name: str, *, mark_custom: bool):
+        new_name = (new_name or "").strip()
+        if not new_name:
+            if mark_custom:
+                ws.name_is_custom = True
+            return
+        if new_name == ws.name:
+            if mark_custom:
+                ws.name_is_custom = True
+            return
+        existing = {w.name for w in self.workspaces if w is not ws}
+        if new_name in existing:
+            base = new_name
+            n = 2
+            while f"{base} ({n})" in existing:
+                n += 1
+            new_name = f"{base} ({n})"
+        old = ws.name
+        was_visible = self.stack.get_visible_child_name() == old
+        self.stack.remove(ws.notebook)
+        ws.name = new_name
+        self.stack.add_named(ws.notebook, new_name)
+        if was_visible:
+            self.stack.set_visible_child_name(new_name)
+        row = self._rows.get(ws)
+        if row is not None:
+            row.name_label.set_text(new_name)
+        if mark_custom:
+            ws.name_is_custom = True
+
+    def _close_workspace(self, ws: Workspace):
+        # Close every tab — that walks the existing _close_tab path which
+        # cancels per-pane timers and (when the last tab is gone) calls
+        # on_empty → _remove_workspace, so we don't have to.
+        for tr in list(ws.tabs()):
+            ws._close_tab(tr)
 
     def _remove_workspace(self, ws: Workspace):
         if ws not in self.workspaces:
@@ -967,6 +1710,12 @@ class LmuxWindow(Gtk.ApplicationWindow):
         row.set_metadata(pane.cwd, git_branch(pane.cwd))
 
     def _on_current_pane_changed(self, ws: Workspace, pane: Pane):
+        # Auto-derive workspace name from the active pane's cwd unless the
+        # user has explicitly renamed it.
+        if not ws.name_is_custom and pane.cwd:
+            derived = os.path.basename(pane.cwd.rstrip("/"))
+            if derived and derived != ws.name:
+                self._set_workspace_name(ws, derived, mark_custom=False)
         self._refresh_row(ws, pane)
 
     def _on_tab_closed(self, cwd: str):
@@ -991,14 +1740,57 @@ class LmuxWindow(Gtk.ApplicationWindow):
         summary: str | None,
         body: str | None,
     ):
-        self._play_bell_sound()
         focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
+        dlog(f"window bell: ws={ws.name} focused_here={focused_here}")
+        self._play_bell_sound()
         if not focused_here:
             ws.mark_bell(tab_root)
             row = self._rows.get(ws)
             if row is not None:
                 row.set_notification(True)
             self._send_desktop_notification(ws, pane, summary, body)
+            self._flash_window()
+
+    def _on_bell_cleared(self, ws: Workspace):
+        dlog(f"bell cleared on ws={ws.name} has_bell={ws.has_bell()}")
+        row = self._rows.get(ws)
+        if row is not None:
+            row.set_notification(ws.has_bell())
+
+    def _flash_window(self):
+        if self._flash_tick_id is not None:
+            self._flash_step = 0
+            return
+        self._flash_step = 0
+        self.main_paned.add_css_class("lmux-flash")
+        self._flash_tick_id = GLib.timeout_add(200, self._flash_tick)
+        dlog("flash: started")
+
+    def _flash_tick(self) -> bool:
+        self._flash_step += 1
+        if self._flash_step >= 6:
+            self.main_paned.remove_css_class("lmux-flash")
+            self._flash_tick_id = None
+            return False
+        if self._flash_step % 2 == 0:
+            self.main_paned.add_css_class("lmux-flash")
+        else:
+            self.main_paned.remove_css_class("lmux-flash")
+        return True
+
+    def _on_idle(self, ws: Workspace, tab_root: TabRoot, pane: Pane):
+        focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
+        dlog(f"window idle: ws={ws.name} focused_here={focused_here}")
+        if focused_here:
+            return
+        self._play_bell_sound()
+        ws.mark_bell(tab_root)
+        row = self._rows.get(ws)
+        if row is not None:
+            row.set_notification(True)
+        body = pane._recent_output_snippet()
+        self._send_desktop_notification(ws, pane, "Claude is waiting", body)
+        self._flash_window()
 
     def _play_bell_sound(self):
         for argv in (
@@ -1010,21 +1802,32 @@ class LmuxWindow(Gtk.ApplicationWindow):
                     argv,
                     Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE,
                 )
+                dlog(f"sound: spawned {argv[0]}")
                 return
-            except GLib.Error:
+            except GLib.Error as e:
+                dlog(f"sound: {argv[0]} failed: {e}")
                 continue
+        dlog("sound: no player worked")
 
     def _send_desktop_notification(
         self, ws: Workspace, pane: Pane, summary: str | None, body: str | None
     ):
         app = self.get_application()
         if app is None:
+            dlog("toast: no application")
             return
         notif = Gio.Notification.new(summary or f"lmux · {pane.title}")
-        text = body or pane.last_notification or f"Activity in {ws.name}"
+        text = (
+            body
+            or pane.last_notification
+            or pane._recent_output_snippet()
+            or f"Activity in {ws.name}"
+        )
         notif.set_body(text)
         notif.set_priority(Gio.NotificationPriority.NORMAL)
-        app.send_notification(f"lmux-{ws.name}-{id(pane)}", notif)
+        nid = f"lmux-{ws.name}-{id(pane)}"
+        app.send_notification(nid, notif)
+        dlog(f"toast: send_notification id={nid} body={text!r}")
 
     def _current_workspace(self) -> Workspace | None:
         row = self.sidebar_list.get_selected_row()
@@ -1035,51 +1838,64 @@ class LmuxWindow(Gtk.ApplicationWindow):
     # --- actions ---
 
     def _install_actions(self, app: Gtk.Application):
-        def add(name: str, fn, accels: list[str]):
+        # Catalog backs the command palette. Entries: (label, action-name, accels, palette-visible)
+        self._action_catalog: list[tuple[str, str, list[str], bool]] = []
+
+        def add(name: str, fn, accels: list[str], label: str | None = None,
+                in_palette: bool = True):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", lambda *_: fn())
             self.add_action(act)
             app.set_accels_for_action(f"win.{name}", accels)
+            if label is not None:
+                self._action_catalog.append((label, name, accels, in_palette))
 
-        add("new-tab", self._new_tab, ["<Ctrl><Shift>t"])
-        add("new-workspace", self.new_workspace, ["<Ctrl><Shift>w"])
-        add("close-pane", self._close_pane, ["<Ctrl><Shift>q"])
-        add("restore-tab", self._restore_closed_tab, ["<Ctrl><Shift>z"])
+        add("new-tab", self._new_tab, ["<Ctrl><Shift>t"], "New tab")
+        add("new-workspace", self.new_workspace, ["<Ctrl><Shift>n"], "New workspace")
+        # Ctrl+Shift+W matches gnome-terminal/browsers ("close"); Ctrl+Shift+Q kept as alias.
+        add("close-pane", self._close_pane, ["<Ctrl><Shift>w", "<Ctrl><Shift>q"], "Close pane / tab")
+        add("restore-tab", self._restore_closed_tab, ["<Ctrl><Shift>z"], "Restore last closed tab")
 
-        add("split-right", self._split_right, ["<Ctrl><Shift>d"])
-        add("split-down", self._split_down, ["<Ctrl><Shift>e"])
-        add("equalize", self._equalize, ["<Ctrl><Shift>0"])
+        add("split-right", self._split_right, ["<Ctrl><Shift>d"], "Split right")
+        add("split-down", self._split_down, ["<Ctrl><Shift>e"], "Split down")
+        add("equalize", self._equalize, ["<Ctrl><Shift>0"], "Equalize splits")
 
-        add("focus-left", lambda: self._focus_dir(-1, 0), ["<Alt>Left"])
-        add("focus-right", lambda: self._focus_dir(1, 0), ["<Alt>Right"])
-        add("focus-up", lambda: self._focus_dir(0, -1), ["<Alt>Up"])
-        add("focus-down", lambda: self._focus_dir(0, 1), ["<Alt>Down"])
+        add("focus-left", lambda: self._focus_dir(-1, 0), ["<Alt>Left"], "Focus left pane")
+        add("focus-right", lambda: self._focus_dir(1, 0), ["<Alt>Right"], "Focus right pane")
+        add("focus-up", lambda: self._focus_dir(0, -1), ["<Alt>Up"], "Focus pane above")
+        add("focus-down", lambda: self._focus_dir(0, 1), ["<Alt>Down"], "Focus pane below")
 
-        add("next-tab", self._next_tab, ["<Ctrl>Tab", "<Ctrl>Page_Down"])
-        add("prev-tab", self._prev_tab, ["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"])
-        add("next-workspace", self._next_workspace, ["<Ctrl><Alt>Down"])
-        add("prev-workspace", self._prev_workspace, ["<Ctrl><Alt>Up"])
+        add("next-tab", self._next_tab,
+            ["<Ctrl>Tab", "<Ctrl>Page_Down", "<Alt>bracketright"], "Next tab")
+        add("prev-tab", self._prev_tab,
+            ["<Ctrl><Shift>Tab", "<Ctrl>Page_Up", "<Alt>bracketleft"], "Previous tab")
+        add("next-workspace", self._next_workspace, ["<Ctrl><Alt>Down"], "Next workspace")
+        add("prev-workspace", self._prev_workspace, ["<Ctrl><Alt>Up"], "Previous workspace")
 
+        # select-tab-N / select-workspace-N are pure index lookups; hide from palette
+        # (the palette will show actual workspace/tab names dynamically).
         for i in range(1, 10):
-            add(
-                f"select-tab-{i}",
-                lambda i=i: self._select_tab(i - 1),
-                [f"<Ctrl>{i}"],
-            )
-            add(
-                f"select-workspace-{i}",
-                lambda i=i: self._select_workspace(i - 1),
-                [f"<Alt>{i}"],
-            )
+            add(f"select-tab-{i}", lambda i=i: self._select_tab(i - 1), [f"<Ctrl>{i}"])
+            add(f"select-workspace-{i}", lambda i=i: self._select_workspace(i - 1), [f"<Alt>{i}"])
 
-        add("toggle-sidebar", self._toggle_sidebar, ["<Ctrl>b"])
+        add("toggle-sidebar", self._toggle_sidebar, ["<Ctrl>b"], "Toggle sidebar")
 
-        add("zoom-in", lambda: self._zoom(0.1), ["<Ctrl>equal", "<Ctrl>plus"])
-        add("zoom-out", lambda: self._zoom(-0.1), ["<Ctrl>minus"])
-        add("zoom-reset", self._zoom_reset, ["<Ctrl>0"])
+        add("zoom-in", lambda: self._zoom(0.1), ["<Ctrl>equal", "<Ctrl>plus"], "Zoom in")
+        add("zoom-out", lambda: self._zoom(-0.1), ["<Ctrl>minus"], "Zoom out")
+        add("zoom-reset", self._zoom_reset, ["<Ctrl>0"], "Reset zoom")
 
-        add("copy", self._copy, ["<Ctrl><Shift>c"])
-        add("paste", self._paste, ["<Ctrl><Shift>v"])
+        add("copy", self._copy, ["<Ctrl><Shift>c"], "Copy")
+        add("paste", self._paste, ["<Ctrl><Shift>v"], "Paste")
+
+        add("find", self._start_find, ["<Ctrl><Shift>f"], "Find in scrollback")
+
+        add("jump-to-bell", self._jump_next_bell, ["<Ctrl><Shift>j"], "Jump to next belling tab")
+
+        # Palette-only — no default keybinds.
+        add("rename-tab", self._rename_current_tab, [], "Rename current tab")
+        add("rename-workspace", self._rename_current_workspace, [], "Rename current workspace")
+
+        add("command-palette", self._open_palette, ["<Ctrl><Shift>p"], "Command palette…")
 
     def _new_tab(self):
         ws = self._current_workspace()
@@ -1187,15 +2003,664 @@ class LmuxWindow(Gtk.ApplicationWindow):
             if pane:
                 pane.paste()
 
+    # --- rename helpers (palette-only) ---
+
+    def _rename_current_tab(self):
+        ws = self._current_workspace()
+        if ws is None:
+            return
+        tr = ws.current_tab_root()
+        if tr is None:
+            return
+        label = ws._tabs.get(tr)
+        if label is not None:
+            label._start_edit()
+
+    def _rename_current_workspace(self):
+        ws = self._current_workspace()
+        if ws is None:
+            return
+        row = self._rows.get(ws)
+        if row is not None:
+            row.start_rename()
+
+    # --- jump to next belling tab ---
+
+    def _jump_next_bell(self):
+        cur_ws = self._current_workspace()
+        if cur_ws is None or not self.workspaces:
+            return
+        cur_ws_i = self.workspaces.index(cur_ws)
+        cur_tab = cur_ws.notebook.get_current_page()
+
+        scan: list[tuple[Workspace, int]] = []
+        for i in range(cur_tab + 1, cur_ws.notebook.get_n_pages()):
+            scan.append((cur_ws, i))
+        for off in range(1, len(self.workspaces) + 1):
+            ws = self.workspaces[(cur_ws_i + off) % len(self.workspaces)]
+            if ws is cur_ws:
+                for i in range(0, cur_tab + 1):
+                    scan.append((ws, i))
+            else:
+                for i in range(ws.notebook.get_n_pages()):
+                    scan.append((ws, i))
+
+        for ws, idx in scan:
+            page = ws.notebook.get_nth_page(idx)
+            if isinstance(page, TabRoot) and page in ws._notif:
+                if ws is not cur_ws:
+                    row = self._rows.get(ws)
+                    if row is not None:
+                        self.sidebar_list.select_row(row)
+                ws.notebook.set_current_page(idx)
+                return
+
+    # --- scrollback search ---
+
+    def _start_find(self):
+        ws = self._current_workspace()
+        pane = ws.current_pane() if ws else None
+        if pane is None:
+            return
+        self._search_target_pane = pane
+        try:
+            pane.term.search_set_wrap_around(True)
+        except Exception:
+            pass
+        self.search_bar.set_search_mode(True)
+        self.search_entry.grab_focus()
+        if self.search_entry.get_text():
+            self.search_entry.select_region(0, -1)
+
+    def _on_search_changed(self, entry: Gtk.SearchEntry):
+        pane = self._search_target_pane
+        if pane is None:
+            return
+        text = entry.get_text()
+        if not text:
+            try:
+                pane.term.search_set_regex(None, 0)
+            except Exception:
+                pass
+            self.search_count_label.set_text("")
+            return
+        try:
+            # PCRE2_UTF | PCRE2_MULTILINE | PCRE2_CASELESS
+            regex = Vte.Regex.new_for_search(GLib.Regex.escape_string(text), -1, 0x00080408)
+            pane.term.search_set_regex(regex, 0)
+            pane.term.search_find_previous()
+        except (TypeError, GLib.Error) as e:
+            dlog(f"search regex failed: {e}")
+        self._update_search_count()
+
+    def _update_search_count(self) -> None:
+        pane = self._search_target_pane
+        text = self.search_entry.get_text()
+        if pane is None or not text:
+            self.search_count_label.set_text("")
+            return
+        try:
+            buf = pane.term.get_text_format(Vte.Format.TEXT)
+        except Exception:
+            buf = None
+        if not buf:
+            self.search_count_label.set_text("")
+            return
+        n = buf.lower().count(text.lower())
+        self.search_count_label.set_text(
+            "no matches" if n == 0 else ("1 match" if n == 1 else f"{n} matches")
+        )
+
+    def _search_step(self, forward: bool):
+        pane = self._search_target_pane
+        if pane is None or not self.search_entry.get_text():
+            return
+        try:
+            if forward:
+                pane.term.search_find_next()
+            else:
+                pane.term.search_find_previous()
+        except Exception as e:
+            dlog(f"search step failed: {e}")
+
+    def _on_search_key(self, _ctrl, keyval, _kc, state):
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if keyval == Gdk.KEY_Escape:
+            self.search_bar.set_search_mode(False)
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._search_step(forward=shift)
+            return True
+        if keyval == Gdk.KEY_Up:
+            self._search_step(forward=False)
+            return True
+        if keyval == Gdk.KEY_Down:
+            self._search_step(forward=True)
+            return True
+        return False
+
+    # --- command palette ---
+
+    def _build_palette_overlay(self):
+        # Build the palette widget tree but DO NOT attach it to self.overlay
+        # yet. We attach on open and detach on close — that way when the
+        # palette isn't visible it has no parent and cannot keep logical
+        # keyboard focus, which is the bug we kept hitting with visibility
+        # toggling alone.
+        self.palette_root = Gtk.Overlay()
+
+        backdrop = Gtk.Box()
+        backdrop.set_hexpand(True)
+        backdrop.set_vexpand(True)
+        backdrop.add_css_class("lmux-palette-backdrop")
+        bclick = Gtk.GestureClick.new()
+        bclick.connect("pressed", lambda *_: self._close_palette())
+        backdrop.add_controller(bclick)
+        self.palette_root.set_child(backdrop)
+
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        panel.add_css_class("lmux-palette")
+        panel.set_size_request(560, 420)
+        panel.set_halign(Gtk.Align.CENTER)
+        panel.set_valign(Gtk.Align.START)
+        panel.set_margin_top(72)
+        panel.set_hexpand(False)
+        panel.set_vexpand(False)
+
+        self.palette_entry = Gtk.SearchEntry()
+        self.palette_entry.set_placeholder_text("Type a command…")
+        self.palette_entry.add_css_class("lmux-palette-entry")
+        self.palette_entry.connect("search-changed", self._on_palette_changed)
+        self.palette_entry.connect("activate", lambda *_: self._palette_activate_selected())
+        pk = Gtk.EventControllerKey.new()
+        pk.connect("key-pressed", self._on_palette_key)
+        self.palette_entry.add_controller(pk)
+        panel.append(self.palette_entry)
+
+        self.palette_scroll = Gtk.ScrolledWindow()
+        self.palette_scroll.set_vexpand(True)
+        self.palette_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.palette_list = Gtk.ListBox()
+        self.palette_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.palette_list.add_css_class("lmux-palette-list")
+        self.palette_list.connect("row-activated", lambda _l, _r: self._palette_activate_selected())
+        self.palette_list.set_filter_func(self._palette_filter_row)
+        self.palette_scroll.set_child(self.palette_list)
+        panel.append(self.palette_scroll)
+
+        self.palette_root.add_overlay(panel)
+
+        self._palette_entries: list[tuple[str, str, object]] = []  # (label, accel_text, callback)
+        self._palette_query: str = ""
+
+    def _palette_is_open(self) -> bool:
+        return self.palette_root.get_parent() is not None
+
+    @staticmethod
+    def _format_accel(accel: str) -> str:
+        try:
+            res = Gtk.accelerator_parse(accel)
+        except Exception:
+            return ""
+        # PyGObject returns (success, key, mods) in GTK4.
+        if isinstance(res, tuple) and len(res) >= 3 and res[0]:
+            return Gtk.accelerator_get_label(res[1], res[2])
+        return ""
+
+    def _open_palette(self):
+        if self._palette_is_open():
+            self.palette_entry.grab_focus()
+            return
+        self._rebuild_palette_entries()
+        self.palette_entry.set_text("")
+        self._palette_query = ""
+        self.palette_list.invalidate_filter()
+        self._palette_select_first_visible()
+        self.overlay.add_overlay(self.palette_root)
+        GLib.idle_add(self.palette_entry.grab_focus)
+
+    def _close_palette(self):
+        if not self._palette_is_open():
+            return
+        # Move focus to the terminal first while the entry is still attached;
+        # then detach the palette entirely. With no parent, the palette's
+        # SearchEntry cannot keep logical focus.
+        ws = self._current_workspace()
+        pane = ws.current_pane() if ws is not None else None
+        if pane is not None:
+            pane.term.grab_focus()
+        else:
+            self.set_focus(None)
+        self.overlay.remove_overlay(self.palette_root)
+        GLib.idle_add(self._focus_current_pane)
+
+    def _rebuild_palette_entries(self):
+        entries: list[tuple[str, str, object]] = []
+
+        # Static actions from the catalog.
+        for label, name, accels, in_palette in self._action_catalog:
+            if not in_palette:
+                continue
+            accel_text = self._format_accel(accels[0]) if accels else ""
+            entries.append((label, accel_text, lambda n=name: self.activate_action(n, None)))
+
+        # Dynamic: workspaces.
+        cur_ws = self._current_workspace()
+        for ws in self.workspaces:
+            marker = "  ●" if ws is cur_ws else ""
+            entries.append((f"Go to workspace: {ws.name}{marker}", "",
+                            lambda w=ws: self._palette_goto_workspace(w)))
+
+        # Dynamic: tabs in current workspace.
+        if cur_ws is not None:
+            for ti in range(cur_ws.notebook.get_n_pages()):
+                tab = cur_ws.notebook.get_nth_page(ti)
+                if not isinstance(tab, TabRoot):
+                    continue
+                lbl = cur_ws._tabs.get(tab)
+                title_text = lbl.label.get_text() if lbl else cur_ws._label_title(tab, tab.active_pane)
+                marker = "  ●" if ti == cur_ws.notebook.get_current_page() else ""
+                entries.append((f"Go to tab: {title_text}{marker}", "",
+                                lambda i=ti: self._palette_goto_tab(i)))
+
+        self._palette_entries = entries
+
+        # Rebuild listbox rows to match entries.
+        child = self.palette_list.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.palette_list.remove(child)
+            child = nxt
+        for label, accel_text, _cb in entries:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            box.set_margin_start(10)
+            box.set_margin_end(10)
+            box.set_margin_top(4)
+            box.set_margin_bottom(4)
+            name_lbl = Gtk.Label(label=label)
+            name_lbl.set_xalign(0)
+            name_lbl.set_hexpand(True)
+            name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            box.append(name_lbl)
+            if accel_text:
+                accel_lbl = Gtk.Label(label=accel_text)
+                accel_lbl.add_css_class("lmux-palette-accel")
+                box.append(accel_lbl)
+            row.set_child(box)
+            self.palette_list.append(row)
+
+    def _palette_matches(self, label: str, q: str) -> bool:
+        if not q:
+            return True
+        qi = 0
+        for ch in label.lower():
+            if qi < len(q) and ch == q[qi]:
+                qi += 1
+                if qi == len(q):
+                    return True
+        return False
+
+    def _palette_visible_indices(self) -> list[int]:
+        q = self._palette_query.strip().lower()
+        return [i for i, (label, _, _) in enumerate(self._palette_entries)
+                if self._palette_matches(label, q)]
+
+    def _palette_filter_row(self, row) -> bool:
+        idx = row.get_index()
+        if idx < 0 or idx >= len(self._palette_entries):
+            return False
+        return self._palette_matches(self._palette_entries[idx][0], self._palette_query.strip().lower())
+
+    def _on_palette_changed(self, entry: Gtk.SearchEntry):
+        self._palette_query = entry.get_text()
+        self.palette_list.invalidate_filter()
+        self._palette_select_first_visible()
+
+    def _palette_select_first_visible(self):
+        idxs = self._palette_visible_indices()
+        if not idxs:
+            self.palette_list.unselect_all()
+            return
+        row = self.palette_list.get_row_at_index(idxs[0])
+        if row is not None:
+            self.palette_list.select_row(row)
+            self._palette_scroll_into_view(row)
+
+    def _palette_move_selection(self, delta: int):
+        idxs = self._palette_visible_indices()
+        if not idxs:
+            return
+        cur = self.palette_list.get_selected_row()
+        cur_idx = cur.get_index() if cur is not None else -1
+        if cur_idx in idxs:
+            pos = idxs.index(cur_idx)
+        else:
+            pos = 0 if delta > 0 else len(idxs) - 1
+            pos = max(0, min(len(idxs) - 1, pos))
+            row = self.palette_list.get_row_at_index(idxs[pos])
+            if row is not None:
+                self.palette_list.select_row(row)
+                self._palette_scroll_into_view(row)
+            return
+        new_pos = max(0, min(len(idxs) - 1, pos + delta))
+        target_row = self.palette_list.get_row_at_index(idxs[new_pos])
+        if target_row is not None:
+            self.palette_list.select_row(target_row)
+            self._palette_scroll_into_view(target_row)
+
+    def _palette_scroll_into_view(self, row: Gtk.ListBoxRow) -> None:
+        # Defer to idle so the row has a valid allocation, then nudge the
+        # scrolled window's vadjustment if the row is above/below the viewport.
+        def do_scroll():
+            alloc = row.get_allocation()
+            if alloc.height <= 0:
+                return False  # not allocated yet; try again next idle
+            vadj = self.palette_scroll.get_vadjustment()
+            if vadj is None:
+                return False
+            page = vadj.get_page_size()
+            top = vadj.get_value()
+            row_top = alloc.y
+            row_bot = row_top + alloc.height
+            if row_top < top:
+                vadj.set_value(row_top)
+            elif row_bot > top + page:
+                vadj.set_value(row_bot - page)
+            return False
+        GLib.idle_add(do_scroll)
+
+    def _on_palette_key(self, _ctrl, keyval, _kc, state):
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if keyval == Gdk.KEY_Escape:
+            self._close_palette()
+            return True
+        if keyval == Gdk.KEY_Down or (ctrl and keyval in (Gdk.KEY_n, Gdk.KEY_N)):
+            self._palette_move_selection(1)
+            return True
+        if keyval == Gdk.KEY_Up or (ctrl and keyval in (Gdk.KEY_p, Gdk.KEY_P)):
+            self._palette_move_selection(-1)
+            return True
+        return False
+
+    def _palette_activate_selected(self):
+        row = self.palette_list.get_selected_row()
+        if row is None:
+            return
+        idx = row.get_index()
+        if not (0 <= idx < len(self._palette_entries)):
+            return
+        _label, _accel, cb = self._palette_entries[idx]
+        self._close_palette()
+        cb()
+
+    def _palette_goto_workspace(self, ws: Workspace):
+        row = self._rows.get(ws)
+        if row is not None:
+            self.sidebar_list.select_row(row)
+
+    def _palette_goto_tab(self, idx: int):
+        ws = self._current_workspace()
+        if ws is not None:
+            ws.select_tab(idx)
+
+    def _on_search_mode_changed(self, *_):
+        if not self.search_bar.get_search_mode():
+            pane = self._search_target_pane
+            self._search_target_pane = None
+            self.search_count_label.set_text("")
+            if pane is not None:
+                try:
+                    pane.term.search_set_regex(None, 0)
+                except Exception:
+                    pass
+                pane.focus_term()
+
 
 CSS = b"""
-.lmux-bell { color: #4c8bf2; font-size: 0.9em; }
+/* ---- accents ----------------------------------------------------------- */
+.lmux-bell {
+    color: #4c8bf2;
+    font-size: 0.65em;
+    margin: 0 2px 0 0;
+}
 .lmux-active-pane { box-shadow: inset 0 0 0 1px #4c8bf2; }
-paned > separator { min-width: 2px; min-height: 2px; }
-notebook header { padding: 0; }
-notebook header tabs { padding: 0; }
-notebook header tab { padding: 2px 8px; min-height: 0; }
+.lmux-flash { box-shadow: inset 0 0 0 3px alpha(#4c8bf2, 0.85); }
+
+/* ---- sidebar shell ----------------------------------------------------- */
+.sidebar {
+    background-color: mix(alpha(currentColor, 0.04), alpha(#4c8bf2, 0.08), 0.5);
+    border-right: 1px solid alpha(#4c8bf2, 0.30);
+}
+
+.lmux-new-ws {
+    padding: 7px 10px;
+    margin: 6px 6px 4px 6px;
+    border-radius: 6px;
+    min-height: 0;
+    color: alpha(currentColor, 0.55);
+    background: transparent;
+    border: 1px solid alpha(currentColor, 0.12);
+    font-size: 0.85em;
+}
+.lmux-new-ws:hover {
+    color: currentColor;
+    background-color: alpha(currentColor, 0.06);
+    border-color: alpha(currentColor, 0.25);
+}
+
+/* ---- sidebar rows ------------------------------------------------------ */
+.navigation-sidebar > row {
+    padding: 7px 4px;
+    margin: 1px 6px;
+    border-radius: 6px;
+    background: transparent;
+    transition: background-color 120ms;
+}
+.navigation-sidebar > row:hover {
+    background-color: alpha(currentColor, 0.05);
+}
+.navigation-sidebar > row:selected {
+    background-color: alpha(currentColor, 0.10);
+    box-shadow: inset 2px 0 0 0 #4c8bf2;
+}
+.navigation-sidebar > row:selected:hover {
+    background-color: alpha(currentColor, 0.14);
+}
+.navigation-sidebar > row:focus,
+.navigation-sidebar > row:focus-visible {
+    outline: none;
+}
+
+.lmux-ws-name {
+    font-weight: 500;
+    font-size: 0.96em;
+}
+.lmux-ws-sub {
+    opacity: 0.55;
+    font-size: 0.78em;
+    margin-top: 1px;
+}
+.lmux-ws-entry {
+    font-weight: 500;
+    font-size: 0.96em;
+    min-height: 0;
+    padding: 0 4px;
+}
+.lmux-tab-entry {
+    min-height: 0;
+    padding: 0 4px;
+    font-size: 0.9em;
+}
+.lmux-search-count {
+    opacity: 0.6;
+    font-size: 0.85em;
+    padding: 0 6px;
+}
+
+/* ---- command palette --------------------------------------------------- */
+.lmux-palette-backdrop {
+    background-color: alpha(#000000, 0.35);
+}
+.lmux-palette {
+    background-color: mix(@theme_bg_color, #1a1d23, 0.6);
+    border: 1px solid alpha(#4c8bf2, 0.45);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px alpha(#000000, 0.5);
+    padding: 4px;
+}
+.lmux-palette-entry {
+    margin: 4px;
+    min-height: 28px;
+}
+.lmux-palette-list { background: transparent; }
+.lmux-palette-list > row {
+    padding: 4px 6px;
+    margin: 1px 4px;
+    border-radius: 5px;
+    background: transparent;
+}
+.lmux-palette-list > row:hover {
+    background-color: alpha(currentColor, 0.07);
+}
+.lmux-palette-list > row:selected {
+    background-color: alpha(#4c8bf2, 0.25);
+    color: currentColor;
+}
+.lmux-palette-accel {
+    opacity: 0.55;
+    font-size: 0.8em;
+    background-color: alpha(currentColor, 0.10);
+    padding: 1px 6px;
+    border-radius: 4px;
+}
+
+/* ---- chips & badges ---------------------------------------------------- */
+.lmux-chip-ready {
+    background-color: #4c8bf2;
+    color: #ffffff;
+    font-size: 0.62em;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 3px;
+    letter-spacing: 0.06em;
+}
+
+.lmux-split-count {
+    background-color: alpha(currentColor, 0.14);
+    color: alpha(currentColor, 0.85);
+    font-size: 0.68em;
+    font-weight: 600;
+    padding: 0 5px;
+    border-radius: 8px;
+    margin-left: 2px;
+}
+
+/* ---- close buttons (x) on tabs and sidebar rows ----------------------- */
+.lmux-tab-close,
+.lmux-ws-close {
+    min-width: 18px;
+    min-height: 18px;
+    padding: 0;
+    margin: 0 0 0 4px;
+    background: transparent;
+    border: none;
+    color: alpha(currentColor, 0.35);
+    opacity: 0;
+    transition: opacity 100ms, color 100ms, background-color 100ms;
+}
+notebook header tab:hover .lmux-tab-close,
+.lmux-tab-close:hover,
+.lmux-tab-close:focus {
+    opacity: 1;
+}
+.navigation-sidebar > row:hover .lmux-ws-close,
+.lmux-ws-close:hover,
+.lmux-ws-close:focus {
+    opacity: 1;
+}
+.lmux-tab-close:hover,
+.lmux-ws-close:hover {
+    color: currentColor;
+    background-color: alpha(currentColor, 0.14);
+    border-radius: 4px;
+}
+
+/* ---- tab-strip action buttons (top-right) ----------------------------- */
+.lmux-tab-actions {
+    padding: 2px 8px 2px 4px;
+}
+.lmux-tab-btn {
+    min-height: 24px;
+    min-width: 28px;
+    padding: 2px 4px;
+    margin: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: alpha(currentColor, 0.55);
+}
+.lmux-tab-btn:hover {
+    color: currentColor;
+    background-color: alpha(currentColor, 0.08);
+}
+.lmux-tab-btn:active {
+    background-color: alpha(currentColor, 0.14);
+}
+
+/* ---- notebook tab strip ----------------------------------------------- */
+notebook header {
+    padding: 0;
+    background-color: alpha(currentColor, 0.04);
+    border-bottom: 1px solid alpha(#4c8bf2, 0.30);
+}
+notebook header.top tabs { padding: 2px 2px 0 2px; }
+notebook header tab {
+    padding: 5px 12px;
+    min-height: 0;
+    margin: 0 1px;
+    border: none;
+    border-radius: 4px 4px 0 0;
+    background: transparent;
+    color: alpha(currentColor, 0.55);
+    transition: color 100ms, background-color 100ms;
+}
+notebook header tab:hover {
+    color: alpha(currentColor, 0.9);
+    background-color: alpha(currentColor, 0.06);
+}
+notebook header tab:checked {
+    color: currentColor;
+    font-weight: 500;
+    background-color: alpha(currentColor, 0.10);
+    box-shadow: inset 0 -2px 0 0 #4c8bf2;
+}
 notebook header tab label { padding: 0; }
+notebook header tab button {
+    min-height: 0;
+    min-width: 0;
+    padding: 0 2px;
+    background: transparent;
+    border: none;
+    color: alpha(currentColor, 0.45);
+}
+notebook header tab button:hover {
+    color: currentColor;
+    background-color: alpha(currentColor, 0.08);
+    border-radius: 4px;
+}
+
+/* ---- paned separators -------------------------------------------------- */
+paned > separator {
+    min-width: 2px;
+    min-height: 2px;
+    background-color: alpha(#4c8bf2, 0.25);
+    transition: background-color 120ms;
+}
+paned > separator:hover,
+paned > separator:active {
+    background-color: #4c8bf2;
+}
 """
 
 
