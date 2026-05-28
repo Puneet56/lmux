@@ -16,7 +16,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Vte", "3.91")
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango, Vte  # noqa: E402
 
 # Dev mode (LMUX_DEV=1) isolates a working-tree run from the installed copy:
 # different APP_ID so single-instance doesn't merge with stable, different
@@ -728,11 +728,25 @@ class WorkspaceRow(Gtk.ListBoxRow):
 
         self.on_rename = None
         self.on_close = None
+        self.on_reorder = None
 
         click = Gtk.GestureClick.new()
         click.set_button(1)
         click.connect("pressed", self._on_name_click)
         self.name_label.add_controller(click)
+
+        # Drag-to-reorder. Source emits this row's listbox index;
+        # drop target on each row receives, and we let the window reshuffle.
+        drag_source = Gtk.DragSource.new()
+        drag_source.set_actions(Gdk.DragAction.MOVE)
+        drag_source.connect("prepare", self._on_drag_prepare)
+        self.add_controller(drag_source)
+
+        drop_target = Gtk.DropTarget.new(GObject.TYPE_INT, Gdk.DragAction.MOVE)
+        drop_target.connect("drop", self._on_drop)
+        drop_target.connect("enter", self._on_drop_enter)
+        drop_target.connect("leave", self._on_drop_leave)
+        self.add_controller(drop_target)
 
         self.name_entry.connect("activate", self._commit_edit)
         key = Gtk.EventControllerKey.new()
@@ -781,6 +795,34 @@ class WorkspaceRow(Gtk.ListBoxRow):
     def _on_close_clicked(self):
         if self.on_close is not None:
             self.on_close()
+
+    # --- drag-and-drop reorder ---
+
+    def _on_drag_prepare(self, _source, _x, _y):
+        val = GObject.Value()
+        val.init(GObject.TYPE_INT)
+        val.set_int(self.get_index())
+        return Gdk.ContentProvider.new_for_value(val)
+
+    def _on_drop(self, _target, value, _x, _y):
+        try:
+            src_idx = int(value)
+        except (TypeError, ValueError):
+            return False
+        target_idx = self.get_index()
+        self.remove_css_class("lmux-drop-target")
+        if src_idx == target_idx:
+            return False
+        if self.on_reorder is not None:
+            self.on_reorder(src_idx, target_idx)
+        return True
+
+    def _on_drop_enter(self, _target, _x, _y):
+        self.add_css_class("lmux-drop-target")
+        return Gdk.DragAction.MOVE
+
+    def _on_drop_leave(self, _target):
+        self.remove_css_class("lmux-drop-target")
 
     def set_metadata(self, cwd: str | None, branch: str | None):
         base = os.path.basename(cwd.rstrip("/")) if cwd else ""
@@ -1616,6 +1658,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         row.workspace = ws  # type: ignore[attr-defined]
         row.on_rename = lambda new, ws=ws: self._rename_workspace(ws, new)
         row.on_close = lambda ws=ws: self._close_workspace(ws)
+        row.on_reorder = self._reorder_workspace
         self._rows[ws] = row
         self.sidebar_list.append(row)
         self.sidebar_list.select_row(row)
@@ -1669,6 +1712,19 @@ class LmuxWindow(Gtk.ApplicationWindow):
             row.name_label.set_text(new_name)
         if mark_custom:
             ws.name_is_custom = True
+
+    def _reorder_workspace(self, src_idx: int, target_idx: int):
+        n = len(self.workspaces)
+        if src_idx == target_idx:
+            return
+        if not (0 <= src_idx < n) or not (0 <= target_idx < n):
+            return
+        ws = self.workspaces.pop(src_idx)
+        self.workspaces.insert(target_idx, ws)
+        row = self._rows[ws]
+        self.sidebar_list.remove(row)
+        self.sidebar_list.insert(row, target_idx)
+        self.sidebar_list.select_row(row)
 
     def _close_workspace(self, ws: Workspace):
         # Close every tab — that walks the existing _close_tab path which
@@ -2471,6 +2527,9 @@ CSS = b"""
 }
 .navigation-sidebar > row:selected:hover {
     background-color: alpha(currentColor, 0.14);
+}
+.navigation-sidebar > row.lmux-drop-target {
+    box-shadow: inset 0 2px 0 0 #4c8bf2;
 }
 .navigation-sidebar > row:focus,
 .navigation-sidebar > row:focus-visible {
