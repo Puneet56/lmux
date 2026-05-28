@@ -64,6 +64,29 @@ def dlog(*args):
         print("[lmux]", *args, file=sys.stderr, flush=True)
 
 
+def _strip_nerd_glyphs(s: str) -> str:
+    """Drop characters from the Unicode Private Use Area — Nerd Font glyphs
+    live in U+E000–F8FF (BMP) and U+F0000–FFFFD (Plane 15). Collapses any
+    whitespace runs left behind so we don't end up with "  ·  text".
+    """
+    out = "".join(
+        c for c in s
+        if not (0xE000 <= ord(c) <= 0xF8FF or 0xF0000 <= ord(c) <= 0xFFFFD)
+    )
+    return " ".join(out.split())
+
+
+def _plain_title(decorated: str, is_claude: bool = False) -> str:
+    """Strip Nerd Font glyphs from a tab title, substituting a 'claude:'
+    prefix when the original carried the robot icon. Empty string after
+    stripping degrades to 'shell'.
+    """
+    plain = _strip_nerd_glyphs(decorated)
+    if is_claude:
+        return f"claude: {plain}" if plain else "claude"
+    return plain or "shell"
+
+
 def _resolve_lmux_binary() -> str:
     """Absolute path to the running lmux binary, for embedding in hook
     commands. Prefer the running argv[0] so dev-mode runs route to the dev
@@ -2149,15 +2172,19 @@ class LmuxWindow(Gtk.ApplicationWindow):
         """Deterministic toast body — '{workspace} · {tab title}'.
 
         Never scrapes terminal text. The summary identifies lmux; the body
-        identifies which workspace and tab are asking for attention.
+        identifies which workspace and tab are asking for attention. Nerd
+        Font glyphs are stripped because mako / libnotify renders them
+        with the system notification font, not lmux's terminal font, so
+        they appear as squished boxes or eat the surrounding whitespace.
         """
         app = self.get_application()
         if app is None:
             dlog("toast: no application")
             return
-        tab_title = ws._label_title(tab_root, pane)
+        tab_title = _plain_title(ws._label_title(tab_root, pane), is_claude=pane._is_claude)
+        ws_name = _strip_nerd_glyphs(ws.name) or "lmux"
         notif = Gio.Notification.new("lmux")
-        body = f"{ws.name} · {tab_title}"
+        body = f"{ws_name} · {tab_title}"
         notif.set_body(body)
         notif.set_priority(Gio.NotificationPriority.NORMAL)
         nid = f"lmux-{ws.name}-{id(pane)}"
