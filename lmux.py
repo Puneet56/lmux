@@ -1508,7 +1508,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self._font_scale = 1.0
         self._closed_cwds: deque[str] = deque(maxlen=CLOSED_TAB_HISTORY)
         self._flash_tick_id: int | None = None
-        self._flash_step = 0
+        self._flash_target: "TabRoot | None" = None
         self._restoring: bool = False
         self.theme = Theme(on_change=self._apply_theme_all)
 
@@ -1945,7 +1945,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         # which window/tab they happen to be looking at.
         self._play_bell_sound()
         self._send_desktop_notification(ws, pane, summary, body)
-        self._flash_window()
+        self._flash_tab(tab_root)
         # Persistent marker dots are only useful when the user isn't already
         # looking at the pane in question.
         if not focused_here:
@@ -1960,26 +1960,29 @@ class LmuxWindow(Gtk.ApplicationWindow):
         if row is not None:
             row.set_notification(ws.has_bell())
 
-    def _flash_window(self):
-        if self._flash_tick_id is not None:
-            self._flash_step = 0
+    def _flash_tab(self, tab_root: "TabRoot | None"):
+        if tab_root is None:
             return
-        self._flash_step = 0
-        self.main_paned.add_css_class("lmux-flash")
-        self._flash_tick_id = GLib.timeout_add(200, self._flash_tick)
+        # If a different tab is mid-flash, end it before retargeting.
+        if self._flash_target is not None and self._flash_target is not tab_root:
+            self._flash_target.remove_css_class("lmux-flash")
+        self._flash_target = tab_root
+        # Retrigger the CSS keyframe animation: remove first, re-add on the
+        # next idle. (Re-adding within the same frame is a no-op.)
+        tab_root.remove_css_class("lmux-flash")
+        GLib.idle_add(lambda tr=tab_root: tr.add_css_class("lmux-flash") or False)
+        if self._flash_tick_id is not None:
+            GLib.source_remove(self._flash_tick_id)
+        # Cleanup slightly after the 900 ms animation finishes.
+        self._flash_tick_id = GLib.timeout_add(1000, self._flash_done)
         dlog("flash: started")
 
-    def _flash_tick(self) -> bool:
-        self._flash_step += 1
-        if self._flash_step >= 6:
-            self.main_paned.remove_css_class("lmux-flash")
-            self._flash_tick_id = None
-            return False
-        if self._flash_step % 2 == 0:
-            self.main_paned.add_css_class("lmux-flash")
-        else:
-            self.main_paned.remove_css_class("lmux-flash")
-        return True
+    def _flash_done(self) -> bool:
+        if self._flash_target is not None:
+            self._flash_target.remove_css_class("lmux-flash")
+            self._flash_target = None
+        self._flash_tick_id = None
+        return False
 
     def _on_idle(self, ws: Workspace, tab_root: TabRoot, pane: Pane):
         focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
@@ -1989,7 +1992,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self._play_bell_sound()
         body = pane._recent_output_snippet()
         self._send_desktop_notification(ws, pane, "Claude is waiting", body)
-        self._flash_window()
+        self._flash_tab(tab_root)
         if not focused_here:
             ws.mark_bell(tab_root)
             row = self._rows.get(ws)
@@ -2644,7 +2647,22 @@ notebook header tab label {
     font-family: monospace;
 }
 .lmux-active-pane { box-shadow: inset 0 0 0 1px #4c8bf2; }
-.lmux-flash { box-shadow: inset 0 0 0 3px alpha(#4c8bf2, 0.85); }
+
+/* Bouncy attention flash on the tab content (not the whole window).
+   Box-shadow oscillates between large/small inset rings to give a
+   pronounced bounce instead of a steady glow. */
+@keyframes lmux-flash {
+    0%   { box-shadow: inset 0 0 0 0px  alpha(#4c8bf2, 0.0); }
+    14%  { box-shadow: inset 0 0 0 9px  alpha(#4c8bf2, 0.95); }
+    32%  { box-shadow: inset 0 0 0 2px  alpha(#4c8bf2, 0.30); }
+    50%  { box-shadow: inset 0 0 0 7px  alpha(#4c8bf2, 0.85); }
+    68%  { box-shadow: inset 0 0 0 3px  alpha(#4c8bf2, 0.45); }
+    84%  { box-shadow: inset 0 0 0 5px  alpha(#4c8bf2, 0.65); }
+    100% { box-shadow: inset 0 0 0 0px  alpha(#4c8bf2, 0.0); }
+}
+.lmux-flash {
+    animation: lmux-flash 900ms ease-out 1;
+}
 
 /* ---- sidebar shell ----------------------------------------------------- */
 .sidebar {
