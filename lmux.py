@@ -3112,18 +3112,20 @@ def _cli_notify(args: list[str]) -> int:
     body = _clean(body)
     seq = f"\x1b]777;notify;{title};{body}\x1b\\"
 
-    if sys.stdin.isatty():
-        try:
-            with open("/dev/tty", "w") as tty:
-                tty.write(seq)
-                tty.flush()
-        except OSError as e:
-            sys.stderr.write(f"lmux notify: cannot open /dev/tty: {e}\n")
-            return 1
+    # Prefer writing OSC 777 to /dev/tty so the surrounding VTE catches it
+    # directly. This works for plain interactive shells inside an lmux pane.
+    # When invoked from a Claude Code hook (v2.1.139+ detaches the hook
+    # subprocess session, so /dev/tty fails with ENXIO), fall back to
+    # emitting `terminalSequence` JSON — Claude relays the escape through
+    # its own pty.
+    try:
+        with open("/dev/tty", "w") as tty:
+            tty.write(seq)
+            tty.flush()
         return 0
-
-    sys.stdout.write(json.dumps({"terminalSequence": seq}) + "\n")
-    return 0
+    except OSError:
+        sys.stdout.write(json.dumps({"terminalSequence": seq}) + "\n")
+        return 0
 
 
 def main() -> int:
