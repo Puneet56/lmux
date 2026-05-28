@@ -69,46 +69,16 @@ Next launch of the desktop entry picks up the new code. Old stable windows keep 
 
 ## Claude Code setup
 
-lmux follows [cmux](https://github.com/manaflow-ai/cmux)'s notification model: it doesn't guess when Claude needs you, it relies on Claude Code's built-in **Notification** and **Stop** hooks to fire explicitly. Wire them up in `~/.claude/settings.json`:
+**No configuration required.** lmux follows [cmux](https://github.com/manaflow-ai/cmux)'s notification model: a small shell wrapper at `~/.cache/lmux/bin/claude` (auto-installed on every launch) shadows the real `claude` binary inside lmux panes, and injects Notification/Stop hooks via Claude Code's `--settings` flag. Outside lmux panes the wrapper passes through unchanged, and `--settings` merges additively with your own `~/.claude/settings.json` so nothing in your config gets clobbered.
 
-```json
-{
-  "hooks": {
-    "Notification": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "lmux notify --title Claude --body \"needs input\""
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "lmux notify --title Claude --body \"done\""
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+What this looks like end-to-end:
 
-`lmux notify` just writes an OSC 777 sequence to `/dev/tty`, so the hook auto-targets whichever lmux pane Claude is actually running in. No socket, no DBus.
+1. lmux launches → writes `~/.cache/lmux/bin/claude` and prepends that dir to every pane shell's `PATH`. Sets `LMUX_PANE=1` so the wrapper knows it's inside lmux.
+2. You type `claude` in a pane → the wrapper resolves the real claude (walks PATH, skips its own dir), then `exec`s it with `--settings '{"hooks":{"Notification":[...],"Stop":[...]}}'`.
+3. Claude needs input (Notification) or finishes a turn (Stop) → fires its hook, which calls `lmux notify --title Claude --body "..."`.
+4. `lmux notify` detects it's running in a Claude Code hook context (stdin is not a tty — Claude Code v2.1.139+ strips `/dev/tty` from hooks) and emits `{"terminalSequence": "\033]777;notify;...\033\\"}` to stdout. Claude relays that OSC 777 through its own pty, where VTE catches it and lmux fires the attention pipeline on that exact pane.
 
-If you'd rather use the terminal bell channel without hooks, this also still works:
-
-```json
-{ "preferredNotifChannel": "terminal_bell" }
-```
-
-— but be aware Claude Code 2.x suppresses BEL emission while you "appear present" (terminal focused, recent keystrokes), so the hook approach above is more reliable.
+Run `lmux notify --title Test --body hi` from inside a pane to verify — you should hear the bell, see the tab badge bump, and (if focused elsewhere) get a desktop toast.
 
 ## Keymap
 
