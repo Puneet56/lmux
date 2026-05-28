@@ -305,10 +305,10 @@ class Pane(Gtk.Box):
         self.last_notification: str | None = None
 
         self.on_changed = None
-        self.on_bell = None
-        self.on_idle = None
+        self.on_attention = None  # callback (pane, source) — replaces on_bell/on_idle
         self.on_exited = None
         self.on_focused = None
+        self.unread_count: int = 0
 
         self._last_output_mono = 0.0
         self._idle_tick_id: int | None = None
@@ -528,8 +528,23 @@ class Pane(Gtk.Box):
             dlog("bell: already notified since last output, skip")
             return
         self._notified_since_output = True
-        if self.on_bell:
-            self.on_bell(self, None, None)
+        self._emit_attention("bell")
+
+    def _emit_attention(self, source: str) -> None:
+        """Single funnel for every attention-trigger (bell / osc777 / idle).
+
+        The LmuxWindow side decides what to do — sound, toast, badge, flash —
+        based on whether this pane is currently focused-here.
+        """
+        if self.on_attention is not None:
+            self.on_attention(self, source)
+
+    def clear_unread(self) -> None:
+        if self.unread_count == 0:
+            return
+        self.unread_count = 0
+        if self.on_changed:
+            self.on_changed(self)
 
     def _recent_output_snippet(self, max_chars: int = 160) -> str | None:
         """Pull a short, human-readable slice of recent terminal text for notification context."""
@@ -635,8 +650,7 @@ class Pane(Gtk.Box):
             return False
         dlog(f"idle fallback: claude quiet for {elapsed:.1f}s")
         self._notified_since_output = True
-        if self.on_idle:
-            self.on_idle(self)
+        self._emit_attention("idle")
         return False
 
     def _on_notification(self, term, summary, body):
@@ -646,8 +660,7 @@ class Pane(Gtk.Box):
             self.on_changed(self)
         if not self._foreground_is_claude():
             return
-        if self.on_bell:
-            self.on_bell(self, summary, body)
+        self._emit_attention("osc777")
 
     def _on_exited(self, term, status):
         dlog(f"pane child-exited status={status}")
@@ -721,10 +734,11 @@ class TabLabel(Gtk.Box):
 
     def __init__(self, title: str, on_close):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        self.dot = Gtk.Label(label="")  # nf-fa-bell
-        self.dot.add_css_class("lmux-bell")
-        self.dot.set_visible(False)
-        self.append(self.dot)
+        # Attention badge: hidden at 0, bell glyph at 1, decimal count at 2+.
+        self.badge = Gtk.Label(label="")
+        self.badge.add_css_class("lmux-bell")
+        self.badge.set_visible(False)
+        self.append(self.badge)
 
         self.label = Gtk.Label(label=title)
         self.label.set_xalign(0)
@@ -773,8 +787,17 @@ class TabLabel(Gtk.Box):
     def set_title(self, title: str):
         self.label.set_text(title)
 
-    def set_notification(self, on: bool):
-        self.dot.set_visible(on)
+    def set_unread(self, n: int):
+        if n <= 0:
+            self.badge.set_visible(False)
+            return
+        if n == 1:
+            self.badge.set_text("")  # nf-fa-bell
+        elif n > 99:
+            self.badge.set_text("99+")
+        else:
+            self.badge.set_text(str(n))
+        self.badge.set_visible(True)
 
     def set_pane_count(self, n: int):
         if n > 1:
@@ -856,11 +879,12 @@ class WorkspaceRow(Gtk.ListBoxRow):
 
         outer.append(text)
 
-        self.chip = Gtk.Label(label="")  # nf-fa-bell
-        self.chip.add_css_class("lmux-chip-ready")
-        self.chip.set_visible(False)
-        self.chip.set_valign(Gtk.Align.CENTER)
-        outer.append(self.chip)
+        # Attention badge mirroring TabLabel's: bell glyph for 1, count for 2+.
+        self.badge = Gtk.Label(label="")
+        self.badge.add_css_class("lmux-chip-ready")
+        self.badge.set_visible(False)
+        self.badge.set_valign(Gtk.Align.CENTER)
+        outer.append(self.badge)
 
         self.close_btn = Gtk.Button()
         self.close_btn.set_icon_name("window-close-symbolic")
@@ -982,8 +1006,17 @@ class WorkspaceRow(Gtk.ListBoxRow):
         else:
             self.sub_label.set_text("")
 
-    def set_notification(self, on: bool):
-        self.chip.set_visible(on)
+    def set_unread(self, n: int):
+        if n <= 0:
+            self.badge.set_visible(False)
+            return
+        if n == 1:
+            self.badge.set_text("")  # nf-fa-bell
+        elif n > 99:
+            self.badge.set_text("99+")
+        else:
+            self.badge.set_text(str(n))
+        self.badge.set_visible(True)
 
 
 _SVG_SPLIT_RIGHT = b"""<?xml version="1.0"?>
@@ -1242,9 +1275,7 @@ class Workspace:
         name: str,
         on_empty,
         on_current_pane_changed,
-        on_bell,
-        on_idle,
-        on_bell_cleared,
+        on_pane_attention,
         on_tab_closed,
         theme_cfg=None,
         font_scale: float = 1.0,
@@ -1256,14 +1287,11 @@ class Workspace:
         self.name_is_custom: bool = False
         self.on_empty = on_empty
         self.on_current_pane_changed = on_current_pane_changed
-        self.on_bell = on_bell
-        self.on_idle = on_idle
-        self.on_bell_cleared = on_bell_cleared
+        self.on_pane_attention = on_pane_attention  # (ws, tab_root, pane, source)
         self.on_tab_closed = on_tab_closed
         self.theme_cfg = theme_cfg or {}
         self.font_scale = font_scale
         self._tabs: dict[TabRoot, TabLabel] = {}
-        self._notif: set[TabRoot] = set()
         self.notebook = Gtk.Notebook()
         self.notebook.set_scrollable(True)
         self.notebook.set_show_border(False)
@@ -1373,16 +1401,16 @@ class Workspace:
             label = self._tabs.get(tab_root)
             if label and tab_root.active_pane is p:
                 label.set_title(self._label_title(tab_root, p))
+                label.set_unread(p.unread_count)
             if self.current_tab_root() is tab_root and tab_root.active_pane is p:
                 self.on_current_pane_changed(self, p)
 
         def focused(p):
             tab_root.set_active(p)
-            self.clear_bell(tab_root)
+            p.clear_unread()
 
         pane.on_changed = changed
-        pane.on_bell = lambda p, s, b: self.on_bell(self, tab_root, p, s, b)
-        pane.on_idle = lambda p: self.on_idle(self, tab_root, p)
+        pane.on_attention = lambda p, src: self.on_pane_attention(self, tab_root, p, src)
         pane.on_exited = lambda p: self._on_pane_exit(tab_root, p)
         pane.on_focused = focused
 
@@ -1416,32 +1444,24 @@ class Workspace:
         if n != -1:
             self.notebook.remove_page(n)
         self._tabs.pop(tab_root, None)
-        self._notif.discard(tab_root)
         if cwd and self.on_tab_closed:
             self.on_tab_closed(cwd)
         if self.notebook.get_n_pages() == 0:
             self.on_empty(self)
 
-    def mark_bell(self, tab_root: TabRoot):
-        if tab_root in self._tabs:
-            self._notif.add(tab_root)
-            self._tabs[tab_root].set_notification(True)
-
-    def clear_bell(self, tab_root: TabRoot):
-        if tab_root in self._notif:
-            self._notif.discard(tab_root)
-            lbl = self._tabs.get(tab_root)
-            if lbl:
-                lbl.set_notification(False)
-            if self.on_bell_cleared:
-                self.on_bell_cleared(self)
-
-    def has_bell(self) -> bool:
-        return bool(self._notif)
+    def unread_total(self) -> int:
+        """Sum unread counts across all panes in this workspace."""
+        total = 0
+        for tr in self._tabs:
+            for p in tr.panes():
+                total += p.unread_count
+        return total
 
     def _on_switch_page(self, _nb, page_widget, _idx):
         if isinstance(page_widget, TabRoot):
-            self.clear_bell(page_widget)
+            # Clearing the active pane's unread fires on_changed →
+            # LmuxWindow recomputes the sidebar count.
+            page_widget.active_pane.clear_unread()
             self.on_current_pane_changed(self, page_widget.active_pane)
             GLib.idle_add(page_widget.active_pane.focus_term)
 
@@ -1741,7 +1761,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
             return
         tr = ws.current_tab_root()
         if tr is not None:
-            ws.clear_bell(tr)
+            tr.active_pane.clear_unread()
             # Pull focus back to the terminal unless an overlay surface owns it.
             if (not self._palette_is_open()
                     and not self.search_bar.get_search_mode()):
@@ -1810,9 +1830,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
             name,
             on_empty=self._remove_workspace,
             on_current_pane_changed=self._on_current_pane_changed,
-            on_bell=self._on_bell,
-            on_idle=self._on_idle,
-            on_bell_cleared=self._on_bell_cleared,
+            on_pane_attention=self._notify,
             on_tab_closed=self._on_tab_closed,
             theme_cfg=self.theme.cfg,
             font_scale=self._font_scale,
@@ -1921,8 +1939,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self.stack.set_visible_child_name(ws.name)
         tr = ws.current_tab_root()
         if tr is not None:
-            ws.clear_bell(tr)
-            row.set_notification(ws.has_bell())
+            tr.active_pane.clear_unread()
             GLib.idle_add(tr.active_pane.focus_term)
 
     def _refresh_row(self, ws: Workspace, pane: Pane):
@@ -1930,6 +1947,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         if row is None:
             return
         row.set_metadata(pane.cwd, git_branch(pane.cwd))
+        row.set_unread(ws.unread_total())
 
     def _on_current_pane_changed(self, ws: Workspace, pane: Pane):
         # Auto-derive workspace name from the active pane's cwd unless the
@@ -1954,35 +1972,24 @@ class LmuxWindow(Gtk.ApplicationWindow):
         for ws in self.workspaces:
             ws.apply_theme(cfg)
 
-    def _on_bell(
-        self,
-        ws: Workspace,
-        tab_root: TabRoot,
-        pane: Pane,
-        summary: str | None,
-        body: str | None,
-    ):
-        focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
-        dlog(f"window bell: ws={ws.name} focused_here={focused_here}")
-        # Always fire the three "interrupt me" signals — even when this is the
-        # focused pane — so the user gets consistent feedback regardless of
-        # which window/tab they happen to be looking at.
-        self._play_bell_sound()
-        self._send_desktop_notification(ws, pane, summary, body)
-        self._flash_tab(tab_root)
-        # Persistent marker dots are only useful when the user isn't already
-        # looking at the pane in question.
-        if not focused_here:
-            ws.mark_bell(tab_root)
-            row = self._rows.get(ws)
-            if row is not None:
-                row.set_notification(True)
+    def _notify(self, ws: Workspace, tab_root: TabRoot, pane: Pane, source: str):
+        """Single funnel for every attention trigger (bell / osc777 / idle).
 
-    def _on_bell_cleared(self, ws: Workspace):
-        dlog(f"bell cleared on ws={ws.name} has_bell={ws.has_bell()}")
-        row = self._rows.get(ws)
-        if row is not None:
-            row.set_notification(ws.has_bell())
+        Behavior follows the cmux model:
+          - always: sound, pane flash, unread count++
+          - if not focused-here: also fire the desktop toast
+        """
+        focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
+        dlog(f"notify: ws={ws.name} source={source} focused_here={focused_here}")
+        pane.unread_count += 1
+        # Trigger label + row redraw via the existing on_changed path.
+        if pane.on_changed is not None:
+            pane.on_changed(pane)
+        self._refresh_row(ws, pane)
+        self._play_bell_sound()
+        self._flash_tab(tab_root)
+        if not focused_here:
+            self._send_desktop_notification(ws, tab_root, pane)
 
     def _flash_tab(self, tab_root: "TabRoot | None"):
         if tab_root is None:
@@ -2008,21 +2015,6 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self._flash_tick_id = None
         return False
 
-    def _on_idle(self, ws: Workspace, tab_root: TabRoot, pane: Pane):
-        focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
-        dlog(f"window idle: ws={ws.name} focused_here={focused_here}")
-        # Always fire sound/notification/flash so the user gets the same
-        # "claude is waiting" feedback whether or not they're on this pane.
-        self._play_bell_sound()
-        body = pane._recent_output_snippet()
-        self._send_desktop_notification(ws, pane, "Claude is waiting", body)
-        self._flash_tab(tab_root)
-        if not focused_here:
-            ws.mark_bell(tab_root)
-            row = self._rows.get(ws)
-            if row is not None:
-                row.set_notification(True)
-
     def _play_bell_sound(self):
         for argv in (
             ["canberra-gtk-play", "-i", "message-new-instant", "--description=lmux"],
@@ -2041,24 +2033,25 @@ class LmuxWindow(Gtk.ApplicationWindow):
         dlog("sound: no player worked")
 
     def _send_desktop_notification(
-        self, ws: Workspace, pane: Pane, summary: str | None, body: str | None
+        self, ws: Workspace, tab_root: "TabRoot", pane: Pane
     ):
+        """Deterministic toast body — '{workspace} · {tab title}'.
+
+        Never scrapes terminal text. The summary identifies lmux; the body
+        identifies which workspace and tab are asking for attention.
+        """
         app = self.get_application()
         if app is None:
             dlog("toast: no application")
             return
-        notif = Gio.Notification.new(summary or f"lmux · {pane.title}")
-        text = (
-            body
-            or pane.last_notification
-            or pane._recent_output_snippet()
-            or f"Activity in {ws.name}"
-        )
-        notif.set_body(text)
+        tab_title = ws._label_title(tab_root, pane)
+        notif = Gio.Notification.new("lmux")
+        body = f"{ws.name} · {tab_title}"
+        notif.set_body(body)
         notif.set_priority(Gio.NotificationPriority.NORMAL)
         nid = f"lmux-{ws.name}-{id(pane)}"
         app.send_notification(nid, notif)
-        dlog(f"toast: send_notification id={nid} body={text!r}")
+        dlog(f"toast: send_notification id={nid} body={body!r}")
 
     def _current_workspace(self) -> Workspace | None:
         row = self.sidebar_list.get_selected_row()
@@ -2659,6 +2652,8 @@ CSS = b"""
     font-family: monospace;
     color: #4c8bf2;
     font-size: 0.85em;
+    font-weight: 600;
+    min-width: 14px;
     margin: 0 2px 0 0;
 }
 /* Tab titles can contain Nerd Font glyphs (e.g. the claude prefix) -
@@ -2801,11 +2796,14 @@ notebook header tab label {
 
 /* ---- chips & badges ---------------------------------------------------- */
 .lmux-chip-ready {
+    font-family: monospace;
     background-color: #4c8bf2;
     color: #ffffff;
     font-size: 0.78em;
-    padding: 2px 6px;
-    border-radius: 3px;
+    font-weight: 600;
+    padding: 1px 7px;
+    border-radius: 9px;
+    min-width: 12px;
 }
 
 .lmux-split-count {
