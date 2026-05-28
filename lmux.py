@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import uuid
 from collections import deque
 from urllib.parse import unquote, urlparse
 
@@ -172,17 +173,22 @@ def install_claude_wrapper() -> None:
         dlog(f"claude wrapper install failed: {e}")
 
 
-def build_pane_env() -> list[str]:
-    """Env array for pane shells: parent env + lmux PATH prefix + LMUX_PANE=1.
+def build_pane_env(pane_id: str | None = None) -> list[str]:
+    """Env array for pane shells: parent env + lmux PATH prefix +
+    LMUX_PANE=1 + LMUX_PANE_ID=<uuid>.
 
     LMUX_BIN_DIR is forced to the front of PATH (deduping existing copies)
     so the claude wrapper always shadows any npm/mise-installed claude.
+    LMUX_PANE_ID lets `lmux notify` route DBus calls back to this exact
+    pane — bypassing the broken-on-VTE-0.84 OSC 777 path.
     """
     env = dict(os.environ)
     existing_path = env.get("PATH", "")
     parts = [p for p in existing_path.split(":") if p and p != LMUX_BIN_DIR]
     env["PATH"] = ":".join([LMUX_BIN_DIR] + parts)
     env["LMUX_PANE"] = "1"
+    if pane_id:
+        env["LMUX_PANE_ID"] = pane_id
     return [f"{k}={v}" for k, v in env.items()]
 
 
@@ -413,6 +419,9 @@ class Pane(Gtk.Box):
         initial_command: str | None = None,
     ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        # Unique pane id, exported to the shell as LMUX_PANE_ID so the
+        # CLI / claude hooks can DBus back to this exact pane.
+        self.pane_id: str = uuid.uuid4().hex
         self.set_hexpand(True)
         self.set_vexpand(True)
         self.term = Vte.Terminal.new()
@@ -470,7 +479,7 @@ class Pane(Gtk.Box):
             Vte.PtyFlags.DEFAULT,
             start_cwd,
             [shell],
-            build_pane_env(),
+            build_pane_env(pane_id=self.pane_id),
             GLib.SpawnFlags.DEFAULT,
             None,
             None,
@@ -2142,16 +2151,25 @@ class LmuxWindow(Gtk.ApplicationWindow):
             import traceback
             ntrace(f"_notify: EXC {e!r}\n{traceback.format_exc()}")
 
-    def cli_notify(self, title: str, body: str) -> None:
-        """Entry point for the DBus `notify` action — fires on the focused
-        pane of the current workspace. Used when `lmux notify` is invoked
-        from a context where /dev/tty isn't writable (e.g. claude's Bash
-        tool) and the hook-relay path doesn't apply either.
+    def cli_notify(self, title: str, body: str, pane_id: str | None = None) -> None:
+        """Entry point for the DBus `notify` action.
+
+        If pane_id is given, route to that exact pane (set by the wrapper /
+        Pane env for hooks). Otherwise fall back to the focused pane of the
+        current workspace.
         """
-        ntrace(f"cli_notify: ENTER title={title!r} body={body!r} workspaces={len(self.workspaces)}")
+        ntrace(f"cli_notify: ENTER title={title!r} body={body!r} pane_id={pane_id!r} workspaces={len(self.workspaces)}")
+        if pane_id:
+            target = self._find_pane_by_id(pane_id)
+            if target is not None:
+                ws, tr, pane = target
+                pane.last_notification = (body or title) or None
+                ntrace(f"cli_notify: routing to pane_id={pane_id} ws={ws.name}")
+                self._notify(ws, tr, pane, "cli")
+                return
+            ntrace(f"cli_notify: pane_id={pane_id} not found, falling back to focused pane")
         ws = self._current_workspace()
         if ws is None:
-            ntrace(f"cli_notify: _current_workspace returned None; falling back to first")
             ws = self.workspaces[0] if self.workspaces else None
             if ws is None:
                 ntrace("cli_notify: NO workspace at all, bailing")
@@ -2162,8 +2180,16 @@ class LmuxWindow(Gtk.ApplicationWindow):
             return
         pane = tr.active_pane
         pane.last_notification = (body or title) or None
-        ntrace(f"cli_notify: calling _notify on ws={ws.name}")
+        ntrace(f"cli_notify: calling _notify on ws={ws.name} (focused-fallback)")
         self._notify(ws, tr, pane, "cli")
+
+    def _find_pane_by_id(self, pane_id: str):
+        for ws in self.workspaces:
+            for tr in ws.tabs():
+                for p in tr.panes():
+                    if getattr(p, "pane_id", None) == pane_id:
+                        return (ws, tr, p)
+        return None
 
     def _flash_tab(self, tab_root: "TabRoot | None"):
         if tab_root is None:
@@ -3118,8 +3144,10 @@ class LmuxApp(Gtk.Application):
             d = param.unpack() if param is not None else {}
             title = str(d.get("title", "lmux") or "lmux")
             body = str(d.get("body", "") or "")
-            ntrace(f"app._on_notify_action: dispatching title={title!r} body={body!r}")
-            win.cli_notify(title, body)
+            pane_id = d.get("pane_id")
+            pane_id = str(pane_id) if pane_id else None
+            ntrace(f"app._on_notify_action: dispatching title={title!r} body={body!r} pane_id={pane_id!r}")
+            win.cli_notify(title, body, pane_id=pane_id)
         except Exception as e:
             import traceback
             ntrace(f"app._on_notify_action: EXC {e!r}\n{traceback.format_exc()}")
@@ -3139,21 +3167,24 @@ class LmuxApp(Gtk.Application):
         win.present()
 
 
-def _send_via_dbus(title: str, body: str) -> bool:
+def _send_via_dbus(title: str, body: str, pane_id: str | None = None) -> bool:
     """Fire the `notify` action on the running LmuxApp over the session bus.
 
-    Returns True only if the call succeeded. Used as a fallback when
-    /dev/tty is unavailable and we're not in a hook-relay context.
+    Returns True only if the call succeeded. `pane_id`, if given, routes
+    to that specific pane; otherwise lands on the focused pane.
     """
     try:
         conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         if conn is None:
             return False
         obj_path = "/" + APP_ID.replace(".", "/")
-        payload = GLib.Variant("a{sv}", {
+        d = {
             "title": GLib.Variant("s", title),
             "body": GLib.Variant("s", body),
-        })
+        }
+        if pane_id:
+            d["pane_id"] = GLib.Variant("s", pane_id)
+        payload = GLib.Variant("a{sv}", d)
         # org.gtk.Actions.Activate(s action, av params, a{sv} platform_data)
         params = GLib.Variant("(sava{sv})", ("notify", [payload], {}))
         conn.call_sync(
@@ -3174,32 +3205,29 @@ def _send_via_dbus(title: str, body: str) -> bool:
 
 
 def _cli_notify(args: list[str]) -> int:
-    """Fire an attention event in the surrounding lmux pane.
+    """Fire an attention event on a specific lmux pane.
 
-    Dispatch order:
-      1. `--from-hook` (set by the wrapper for Claude Code hooks): emit
-         only `{"terminalSequence": ...}` JSON on stdout so claude relays
-         OSC 777 through its own pty, auto-targeting the claude pane.
-      2. Try `/dev/tty`: works for plain interactive shells inside an
-         lmux pane. OSC 777 lands directly in VTE.
-      3. DBus fallback: fire the `notify` action on the running LmuxApp.
-         Lands on the focused pane. Covers manual `lmux notify` from
-         contexts where /dev/tty is detached (claude's Bash tool, etc.).
-      4. Last resort: emit terminalSequence JSON anyway.
+    Primary path is DBus to the running LmuxApp's `notify` action,
+    routed to the pane identified by `LMUX_PANE_ID` env (set by the
+    pane's shell on spawn). VTE 0.84+ no longer parses OSC 777 so the
+    older /dev/tty + terminalSequence route is dead and not attempted.
     """
     title = "lmux"
     body = ""
-    from_hook = False
+    from_hook = False  # accepted but no longer changes behavior
+    explicit_pane_id: str | None = None
     i = 0
     while i < len(args):
         a = args[i]
         if a in ("-h", "--help"):
             sys.stdout.write(
-                "usage: lmux notify [--title TITLE] [--body BODY] [--from-hook]\n"
+                "usage: lmux notify [--title TITLE] [--body BODY] "
+                "[--pane-id ID] [--from-hook]\n"
                 "\n"
-                "Fires an attention event in the surrounding lmux pane.\n"
-                "  --from-hook  emit terminalSequence JSON only; used by the\n"
-                "               claude wrapper's injected Notification/Stop hooks\n"
+                "Fires an attention event on an lmux pane.\n"
+                "Routes via DBus to the running lmux. Pane targeting:\n"
+                "  --pane-id ID  explicit target (defaults to $LMUX_PANE_ID)\n"
+                "  --from-hook   accepted for compatibility; same behavior\n"
             )
             return 0
         if a == "--from-hook":
@@ -3214,32 +3242,25 @@ def _cli_notify(args: list[str]) -> int:
             body = args[i + 1]
             i += 2
             continue
+        if a == "--pane-id" and i + 1 < len(args):
+            explicit_pane_id = args[i + 1]
+            i += 2
+            continue
         sys.stderr.write(f"lmux notify: unknown argument {a!r}\n")
         return 2
 
-    def _clean(s: str) -> str:
-        return s.replace(";", " ").replace("\x1b", " ").replace("\x07", " ")
+    pane_id = explicit_pane_id or os.environ.get("LMUX_PANE_ID") or None
 
-    title = _clean(title)
-    body = _clean(body)
-    seq = f"\x1b]777;notify;{title};{body}\x1b\\"
-
-    if from_hook:
-        sys.stdout.write(json.dumps({"terminalSequence": seq}) + "\n")
+    if _send_via_dbus(title, body, pane_id=pane_id):
         return 0
 
-    try:
-        with open("/dev/tty", "w") as tty:
-            tty.write(seq)
-            tty.flush()
-        return 0
-    except OSError:
-        pass
-
-    if _send_via_dbus(title, body):
-        return 0
-
-    sys.stdout.write(json.dumps({"terminalSequence": seq}) + "\n")
+    # DBus unreachable (lmux not running, bus problem). Print a
+    # diagnostic to stderr but exit 0 so a hook failure doesn't cascade
+    # into Claude Code marking the hook as broken.
+    sys.stderr.write(
+        f"lmux notify: dbus call failed (lmux not running?) "
+        f"title={title!r} body={body!r} pane_id={pane_id!r} from_hook={from_hook}\n"
+    )
     return 0
 
 
