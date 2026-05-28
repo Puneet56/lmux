@@ -720,7 +720,8 @@ class TabLabel(Gtk.Box):
         self.count_badge.set_visible(False)
         self.append(self.count_badge)
 
-        self.close_btn = Gtk.Button(label="")  # nf-fa-times
+        self.close_btn = Gtk.Button()
+        self.close_btn.set_icon_name("window-close-symbolic")
         self.close_btn.add_css_class("lmux-tab-close")
         self.close_btn.add_css_class("flat")
         self.close_btn.set_valign(Gtk.Align.CENTER)
@@ -837,7 +838,8 @@ class WorkspaceRow(Gtk.ListBoxRow):
         self.chip.set_valign(Gtk.Align.CENTER)
         outer.append(self.chip)
 
-        self.close_btn = Gtk.Button(label="")  # nf-fa-times
+        self.close_btn = Gtk.Button()
+        self.close_btn.set_icon_name("window-close-symbolic")
         self.close_btn.add_css_class("lmux-ws-close")
         self.close_btn.add_css_class("flat")
         self.close_btn.set_valign(Gtk.Align.CENTER)
@@ -2621,9 +2623,19 @@ class LmuxWindow(Gtk.ApplicationWindow):
 CSS = b"""
 /* ---- accents ----------------------------------------------------------- */
 .lmux-bell {
+    font-family: monospace;
     color: #4c8bf2;
     font-size: 0.85em;
     margin: 0 2px 0 0;
+}
+/* Tab titles can contain Nerd Font glyphs (e.g. the claude prefix) -
+   force the same font family for the whole label so the glyph and
+   surrounding text share metrics and align on the baseline. */
+notebook header tab label {
+    font-family: monospace;
+}
+.lmux-chip-ready {
+    font-family: monospace;
 }
 .lmux-active-pane { box-shadow: inset 0 0 0 1px #4c8bf2; }
 .lmux-flash { box-shadow: inset 0 0 0 3px alpha(#4c8bf2, 0.85); }
@@ -2761,11 +2773,10 @@ CSS = b"""
 /* ---- close buttons (x) on tabs and sidebar rows ----------------------- */
 .lmux-tab-close,
 .lmux-ws-close {
-    min-width: 16px;
-    min-height: 16px;
-    padding: 0 4px;
+    min-width: 18px;
+    min-height: 18px;
+    padding: 0;
     margin: 0 0 0 4px;
-    font-size: 0.82em;
     background: transparent;
     border: none;
     color: alpha(currentColor, 0.35);
