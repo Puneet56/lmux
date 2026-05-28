@@ -45,6 +45,15 @@ try:
 except ValueError:
     CLAUDE_IDLE_SEC = 5.0
 
+# Per-pane minimum gap between attention events. Squashes the bell+osc777+idle
+# triple-fire from one claude completion, and silences the "claude is thinking"
+# pauses that the 5-second idle heuristic otherwise interprets as 5 separate
+# done-events during one long working session.
+try:
+    ATTENTION_DEBOUNCE_SEC = float(os.environ.get("LMUX_ATTENTION_DEBOUNCE_SEC", "30"))
+except ValueError:
+    ATTENTION_DEBOUNCE_SEC = 30.0
+
 # When a pane that was running `claude` is restored from state.json, lmux types
 # this command into the freshly-spawned shell so the conversation resumes.
 # Override via env if you don't want --dangerously-skip-permissions, or set
@@ -313,6 +322,7 @@ class Pane(Gtk.Box):
         self._last_output_mono = 0.0
         self._idle_tick_id: int | None = None
         self._notified_since_output = True
+        self._last_attention_mono: float = 0.0
         self._last_cursor_pos: tuple[int, int] = (-1, -1)
         self._last_branch: str | None = None
         self._is_claude: bool = False
@@ -536,6 +546,13 @@ class Pane(Gtk.Box):
         The LmuxWindow side decides what to do — sound, toast, badge, flash —
         based on whether this pane is currently focused-here.
         """
+        now_t = GLib.get_monotonic_time() / 1_000_000.0
+        if ATTENTION_DEBOUNCE_SEC > 0 and self._last_attention_mono:
+            gap = now_t - self._last_attention_mono
+            if gap < ATTENTION_DEBOUNCE_SEC:
+                dlog(f"attention debounced: source={source} gap={gap:.1f}s < {ATTENTION_DEBOUNCE_SEC}s")
+                return
+        self._last_attention_mono = now_t
         if self.on_attention is not None:
             self.on_attention(self, source)
 
@@ -660,6 +677,10 @@ class Pane(Gtk.Box):
             self.on_changed(self)
         if not self._foreground_is_claude():
             return
+        if self._notified_since_output:
+            dlog("osc777: already notified since last output, skip")
+            return
+        self._notified_since_output = True
         self._emit_attention("osc777")
 
     def _on_exited(self, term, status):
