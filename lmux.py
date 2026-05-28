@@ -2272,10 +2272,14 @@ class LmuxWindow(Gtk.ApplicationWindow):
             if label is not None:
                 self._action_catalog.append((label, name, accels, in_palette))
 
-        add("new-tab", self._new_tab, ["<Ctrl><Shift>t"], "New tab")
+        # Primary binds match the cross-app convention the user's Hyprland
+        # config relies on (Super+T / Super+W sendshortcut Ctrl+T / Ctrl+W to
+        # the active window). The Ctrl+Shift+* variants stay as aliases.
+        add("new-tab", self._new_tab,
+            ["<Ctrl>t", "<Ctrl><Shift>t"], "New tab")
         add("new-workspace", self.new_workspace, ["<Ctrl><Shift>n"], "New workspace")
-        # Ctrl+Shift+W matches gnome-terminal/browsers ("close"); Ctrl+Shift+Q kept as alias.
-        add("close-pane", self._close_pane, ["<Ctrl><Shift>w", "<Ctrl><Shift>q"], "Close pane / tab")
+        add("close-pane", self._close_pane,
+            ["<Ctrl>w", "<Ctrl><Shift>w", "<Ctrl><Shift>q"], "Close pane / tab")
         add("restore-tab", self._restore_closed_tab, ["<Ctrl><Shift>z"], "Restore last closed tab")
 
         add("split-right", self._split_right, ["<Ctrl><Shift>d"], "Split right")

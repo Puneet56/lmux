@@ -96,9 +96,9 @@ Hooks installed by the wrapper pass `--from-hook` to skip straight to path 3, so
 | `Alt+Shift+O` / `Ctrl+Shift+O` | Open project… — fuzzy-pick a directory under `~/Projects` / `~/Work`, create-or-switch a workspace with editor + shell tabs (tmux-sessionizer equivalent) |
 | `Alt+Shift+F` | Switch workspace… — fuzzy-pick an existing workspace (tmux-session-picker equivalent). Only fires while an lmux window is focused so it doesn't interfere with other apps' Alt+Shift+F handlers |
 | `Ctrl+B` | Toggle sidebar |
-| `Ctrl+Shift+T` | New tab (inherits cwd of focused pane) |
+| `Ctrl+T` / `Ctrl+Shift+T` | New tab (inherits cwd of focused pane). `Ctrl+T` matches the cross-app new-tab convention so a WM bind that sends `Ctrl+T` (e.g. `Super+T → sendshortcut CTRL,T`) works here |
 | `Ctrl+Shift+N` | New workspace |
-| `Ctrl+Shift+W` | Close pane / tab (`Ctrl+Shift+Q` also works) |
+| `Ctrl+W` / `Ctrl+Shift+W` / `Ctrl+Shift+Q` | Close pane / tab. Same cross-app convention rationale as `Ctrl+T` |
 | `Ctrl+Shift+Z` | Restore last closed tab |
 | `Ctrl+Shift+J` | Jump to next belling tab (across workspaces) |
 | `Ctrl+Shift+D` | Split right |
