@@ -16,9 +16,10 @@ GTK4 + VTE + Python, single file (~700 lines). Built for running [Claude Code](h
 - **Command palette** — `Ctrl+Shift+P` opens a fuzzy-searchable list of every action plus "Go to workspace…" / "Go to tab…" entries. Esc / click-outside closes
 - **Persisted layout** — workspaces, tabs, splits, cwds, and custom titles are saved on window close to `~/.cache/lmux/state.json` and restored on next launch
 - **Claude session auto-resume** — panes that had `claude` as their foreground process at save time are restored with `claude --continue --dangerously-skip-permissions` typed in automatically, so you land back in your conversation. Override the command via `LMUX_CLAUDE_RESUME_CMD=...`; set it to empty to disable
-- **Claude Code bell only** — `\a` and OSC 777 notifications are gated on `/proc/<fg-pgrp>/comm` containing `claude`, so shell tab-completion bells don't trigger anything
-- **Output-idle fallback** — Claude Code v2.x rarely emits a raw BEL because its notification dispatcher suppresses `push_notification` events whenever the user appears "present" (terminal focused, or last keystroke <60 s ago). So lmux additionally treats a pane as needing attention if `comm=claude` *and* the pane has been silent for `LMUX_CLAUDE_IDLE_SEC` seconds (default 5) after recent output. Set `LMUX_CLAUDE_IDLE_SEC=0` to disable.
-- **Audible bell** (`message-new-instant.oga` via `canberra-gtk-play`) + **blue ● on tab and sidebar row** + **mako desktop toast** + **window border flash** (~1 s blue pulse, à la cmux) — but only when the ringing pane isn't the one you're looking at
+- **Explicit-trigger notifications** (cmux-style) — no idle heuristics or terminal scraping. Two channels:
+  - **VTE BEL (`\a`)** — gated on `/proc/<fg-pgrp>/comm` containing `claude`, so shell tab-completion bells stay quiet.
+  - **OSC 777** — anything that prints `\033]777;notify;TITLE;BODY\033\\` to a pane's tty fires an attention event. The `lmux notify` CLI is a thin wrapper that writes exactly that, so it auto-targets the pane it ran in.
+- **Audible bell** (`message-new-instant.oga` via `canberra-gtk-play`) + **counted badge on tab and sidebar row** + **mako desktop toast** + **bouncy tab flash** — toast suppressed when the ringing pane is focused-here; sound + flash + count always fire
 - **Debug logging** — `LMUX_DEBUG=1 ./lmux.py 2>/tmp/lmux.log` prints breadcrumbs at every step of the bell + idle pipeline (signal received → gate check → window handler → sound spawn → toast send)
 - **Sidebar metadata** — each workspace row shows its current pane's `cwd` and git branch (`.git/HEAD` walk, no subprocess). Branch changes (e.g. `git checkout`) are picked up live via 1.2 s poll without leaving the pane focused
 - **Live kitty theme reload** — reads `~/.config/kitty/kitty.conf` (resolving `include`), follows omarchy theme switches via a file monitor on `theme.name`
@@ -68,13 +69,46 @@ Next launch of the desktop entry picks up the new code. Old stable windows keep 
 
 ## Claude Code setup
 
-For Claude Code to actually emit the terminal bell (vs the macOS-style iTerm2 OSC 9 it picks by default on many setups), add to `~/.claude/settings.json`:
+lmux follows [cmux](https://github.com/manaflow-ai/cmux)'s notification model: it doesn't guess when Claude needs you, it relies on Claude Code's built-in **Notification** and **Stop** hooks to fire explicitly. Wire them up in `~/.claude/settings.json`:
 
 ```json
 {
-  "preferredNotifChannel": "terminal_bell"
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lmux notify --title Claude --body \"needs input\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lmux notify --title Claude --body \"done\""
+          }
+        ]
+      }
+    ]
+  }
 }
 ```
+
+`lmux notify` just writes an OSC 777 sequence to `/dev/tty`, so the hook auto-targets whichever lmux pane Claude is actually running in. No socket, no DBus.
+
+If you'd rather use the terminal bell channel without hooks, this also still works:
+
+```json
+{ "preferredNotifChannel": "terminal_bell" }
+```
+
+— but be aware Claude Code 2.x suppresses BEL emission while you "appear present" (terminal focused, recent keystrokes), so the hook approach above is more reliable.
 
 ## Keymap
 

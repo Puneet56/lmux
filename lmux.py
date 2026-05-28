@@ -40,19 +40,6 @@ STATE_PATH = os.path.expanduser(
 STATE_VERSION = 1
 
 DEBUG = os.environ.get("LMUX_DEBUG") == "1"
-try:
-    CLAUDE_IDLE_SEC = float(os.environ.get("LMUX_CLAUDE_IDLE_SEC", "5"))
-except ValueError:
-    CLAUDE_IDLE_SEC = 5.0
-
-# Per-pane minimum gap between attention events. Squashes the bell+osc777+idle
-# triple-fire from one claude completion, and silences the "claude is thinking"
-# pauses that the 5-second idle heuristic otherwise interprets as 5 separate
-# done-events during one long working session.
-try:
-    ATTENTION_DEBOUNCE_SEC = float(os.environ.get("LMUX_ATTENTION_DEBOUNCE_SEC", "30"))
-except ValueError:
-    ATTENTION_DEBOUNCE_SEC = 30.0
 
 # When a pane that was running `claude` is restored from state.json, lmux types
 # this command into the freshly-spawned shell so the conversation resumes.
@@ -319,10 +306,6 @@ class Pane(Gtk.Box):
         self.on_focused = None
         self.unread_count: int = 0
 
-        self._last_output_mono = 0.0
-        self._idle_tick_id: int | None = None
-        self._notified_since_output = True
-        self._last_attention_mono: float = 0.0
         self._last_cursor_pos: tuple[int, int] = (-1, -1)
         self._last_branch: str | None = None
         self._is_claude: bool = False
@@ -531,28 +514,22 @@ class Pane(Gtk.Box):
         return ok
 
     def _on_bell(self, term):
+        # VTE BEL is an unsolicited signal — filter shell tab-completion bells
+        # by requiring claude to be the foreground process. OSC 777, by
+        # contrast, is explicit (an `lmux notify` / Claude Code hook printed
+        # it) so we don't gate it.
         dlog("vte bell signal fired")
         if not self._foreground_is_claude():
             return
-        if self._notified_since_output:
-            dlog("bell: already notified since last output, skip")
-            return
-        self._notified_since_output = True
         self._emit_attention("bell")
 
     def _emit_attention(self, source: str) -> None:
-        """Single funnel for every attention-trigger (bell / osc777 / idle).
+        """Single funnel for every attention-trigger (bell / osc777).
 
-        The LmuxWindow side decides what to do — sound, toast, badge, flash —
-        based on whether this pane is currently focused-here.
+        cmux-style: explicit signals only, no heuristics. The LmuxWindow side
+        decides what to do — sound, toast, badge, flash — based on whether
+        this pane is currently focused-here.
         """
-        now_t = GLib.get_monotonic_time() / 1_000_000.0
-        if ATTENTION_DEBOUNCE_SEC > 0 and self._last_attention_mono:
-            gap = now_t - self._last_attention_mono
-            if gap < ATTENTION_DEBOUNCE_SEC:
-                dlog(f"attention debounced: source={source} gap={gap:.1f}s < {ATTENTION_DEBOUNCE_SEC}s")
-                return
-        self._last_attention_mono = now_t
         if self.on_attention is not None:
             self.on_attention(self, source)
 
@@ -634,10 +611,6 @@ class Pane(Gtk.Box):
         if pos == self._last_cursor_pos:
             return
         self._last_cursor_pos = pos
-        self._last_output_mono = GLib.get_monotonic_time() / 1_000_000.0
-        self._notified_since_output = False
-        if self._idle_tick_id is None and CLAUDE_IDLE_SEC > 0:
-            self._idle_tick_id = GLib.timeout_add(1000, self._idle_tick)
         # Inject the queued startup command (claude --continue ...) on first
         # real shell output, when we know the prompt is up and reading stdin.
         if self._pending_command:
@@ -653,34 +626,14 @@ class Pane(Gtk.Box):
                 return False
             GLib.idle_add(_feed)
 
-    def _idle_tick(self) -> bool:
-        if not self.term.get_realized():
-            self._idle_tick_id = None
-            return False
-        elapsed = GLib.get_monotonic_time() / 1_000_000.0 - self._last_output_mono
-        if elapsed < CLAUDE_IDLE_SEC:
-            return True
-        self._idle_tick_id = None
-        if self._notified_since_output:
-            return False
-        if not self._foreground_is_claude():
-            return False
-        dlog(f"idle fallback: claude quiet for {elapsed:.1f}s")
-        self._notified_since_output = True
-        self._emit_attention("idle")
-        return False
-
     def _on_notification(self, term, summary, body):
+        # OSC 777 is an explicit signal: someone (Claude Code hook, `lmux
+        # notify`, a script) printed `\033]777;notify;...\033\\` to this pty.
+        # Trust it — no gating, no debounce.
         dlog(f"vte notification-received summary={summary!r} body={body!r}")
         self.last_notification = body or summary or None
         if self.on_changed:
             self.on_changed(self)
-        if not self._foreground_is_claude():
-            return
-        if self._notified_since_output:
-            dlog("osc777: already notified since last output, skip")
-            return
-        self._notified_since_output = True
         self._emit_attention("osc777")
 
     def _on_exited(self, term, status):
@@ -698,9 +651,6 @@ class Pane(Gtk.Box):
         if self._cwd_poll_id:
             GLib.source_remove(self._cwd_poll_id)
             self._cwd_poll_id = None
-        if self._idle_tick_id:
-            GLib.source_remove(self._idle_tick_id)
-            self._idle_tick_id = None
 
     def refresh_claude_marker(self) -> None:
         """Authoritative claude check via session scan.
@@ -3001,8 +2951,63 @@ class LmuxApp(Gtk.Application):
         win.present()
 
 
+def _cli_notify(args: list[str]) -> int:
+    """Emit an OSC 777 notification to our controlling tty.
+
+    Mirrors `cmux notify` semantics for explicit-trigger notifications. When
+    run from inside an lmux pane (the typical case: a Claude Code hook
+    command), the surrounding VTE catches the escape and fires the
+    `notification-received` signal on that pane — auto-targeting the pane
+    the hook actually ran in, with no socket or DBus routing needed.
+    """
+    title = "lmux"
+    body = ""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            sys.stdout.write(
+                "usage: lmux notify [--title TITLE] [--body BODY]\n"
+                "\n"
+                "Writes OSC 777 to /dev/tty. Inside an lmux pane, this fires\n"
+                "an attention event (sound + flash + badge, plus a desktop\n"
+                "toast when the pane is not focused).\n"
+            )
+            return 0
+        if a == "--title" and i + 1 < len(args):
+            title = args[i + 1]
+            i += 2
+            continue
+        if a == "--body" and i + 1 < len(args):
+            body = args[i + 1]
+            i += 2
+            continue
+        sys.stderr.write(f"lmux notify: unknown argument {a!r}\n")
+        return 2
+
+    def _clean(s: str) -> str:
+        # OSC 777 uses ';' as a field separator and ESC ends the sequence —
+        # strip both so user-supplied text can't break the payload.
+        return s.replace(";", " ").replace("\x1b", " ").replace("\x07", " ")
+
+    title = _clean(title)
+    body = _clean(body)
+    seq = f"\x1b]777;notify;{title};{body}\x1b\\"
+    try:
+        with open("/dev/tty", "w") as tty:
+            tty.write(seq)
+            tty.flush()
+    except OSError as e:
+        sys.stderr.write(f"lmux notify: cannot open /dev/tty: {e}\n")
+        return 1
+    return 0
+
+
 def main() -> int:
-    return LmuxApp().run(sys.argv)
+    argv = sys.argv
+    if len(argv) >= 2 and argv[1] == "notify":
+        return _cli_notify(argv[2:])
+    return LmuxApp().run(argv)
 
 
 if __name__ == "__main__":
