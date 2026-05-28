@@ -53,13 +53,9 @@ CLAUDE_RESUME_CMD = os.environ.get(
 )
 
 # Commands spawned in a freshly-opened project workspace. Three tabs:
-# editor (focused), claude (--dangerously-skip-permissions by default), shell.
-# Override via env to tweak the editor binary or the claude flags.
-LMUX_EDITOR = os.environ.get("LMUX_EDITOR") or os.environ.get("EDITOR") or "nvim"
-LMUX_CLAUDE_CMD = os.environ.get(
-    "LMUX_CLAUDE_CMD",
-    "claude --dangerously-skip-permissions",
-)
+# editor (nvim, focused), claude (--dangerously-skip-permissions), shell.
+PROJECT_EDITOR_CMD = "nvim"
+PROJECT_CLAUDE_CMD = "claude --dangerously-skip-permissions"
 
 # Where the "Open project…" picker looks for project directories. Colon-
 # separated, expanded via ~. Default matches the tmux-sessionizer layout.
@@ -2007,8 +2003,8 @@ class LmuxWindow(Gtk.ApplicationWindow):
         # Otherwise build a new workspace with three tabs: editor (focused),
         # claude with --dangerously-skip-permissions, and a plain shell.
         ws = self._make_workspace(name, with_default_tab=False)
-        ws.add_tab(cwd=path, initial_command=LMUX_EDITOR, custom_title="editor", focus=True)
-        ws.add_tab(cwd=path, initial_command=LMUX_CLAUDE_CMD, custom_title="claude", focus=False)
+        ws.add_tab(cwd=path, initial_command=PROJECT_EDITOR_CMD, custom_title="editor", focus=True)
+        ws.add_tab(cwd=path, initial_command=PROJECT_CLAUDE_CMD, custom_title="claude", focus=False)
         ws.add_tab(cwd=path, custom_title="shell", focus=False)
         ws.notebook.set_current_page(0)
         first = ws.current_pane()
