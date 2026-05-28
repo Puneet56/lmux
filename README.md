@@ -14,6 +14,8 @@ GTK4 + VTE + Python, single file (~700 lines). Built for running [Claude Code](h
 - **Scrollback search** — `Ctrl+Shift+F` opens a search bar with a live hit count; Enter jumps to the previous (older) match, Shift+Enter to the next (newer), Esc closes
 - **Jump to next bell** — `Ctrl+Shift+J` cycles you to the next tab waiting on you, across workspaces
 - **Command palette** — `Ctrl+Shift+P` opens a fuzzy-searchable list of every action plus "Go to workspace…" / "Go to tab…" entries. Esc / click-outside closes
+- **Project picker (tmux-sessionizer style)** — `Ctrl+Shift+O` (or `lmux open-project` from any shell) opens a fuzzy picker over directories under `~/Projects` and `~/Work`. Hitting Enter creates a new workspace named after the project with an editor tab (running `$LMUX_EDITOR`, default `nvim`) and a shell tab — or switches to an already-open workspace with that name. Override the search roots via `LMUX_PROJECT_DIRS=path1:path2`. Pair with a window-manager bind like `bind = SUPER, F, exec, lmux open-project` for the Primeagen UX
+- **Workspace picker** — `lmux switch-workspace` (no internal keybind since `Ctrl+Shift+F` is taken by search) opens the palette in workspace-only mode. Pair with `bind = SUPER, O, exec, lmux switch-workspace` at the WM level
 - **Persisted layout** — workspaces, tabs, splits, cwds, and custom titles are saved on window close to `~/.cache/lmux/state.json` and restored on next launch
 - **Claude session auto-resume** — panes that had `claude` as their foreground process at save time are restored with `claude --continue --dangerously-skip-permissions` typed in automatically, so you land back in your conversation. Override the command via `LMUX_CLAUDE_RESUME_CMD=...`; set it to empty to disable
 - **Explicit-trigger notifications** (cmux-style) — no idle heuristics or terminal scraping. Two channels:
@@ -91,6 +93,7 @@ Hooks installed by the wrapper pass `--from-hook` to skip straight to path 3, so
 | Shortcut | Action |
 |---|---|
 | `Ctrl+Shift+P` | Command palette (fuzzy search every action + workspaces + tabs) |
+| `Ctrl+Shift+O` | Open project… — fuzzy-pick a directory under `~/Projects` / `~/Work`, create-or-switch a workspace with editor + shell tabs (tmux-sessionizer equivalent) |
 | `Ctrl+B` | Toggle sidebar |
 | `Ctrl+Shift+T` | New tab (inherits cwd of focused pane) |
 | `Ctrl+Shift+N` | New workspace |

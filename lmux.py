@@ -52,6 +52,14 @@ CLAUDE_RESUME_CMD = os.environ.get(
     "claude --continue --dangerously-skip-permissions",
 )
 
+# Editor command spawned in the first tab of a project workspace (Primeagen-
+# style: editor + shell tabs). Falls back through LMUX_EDITOR → $EDITOR → nvim.
+LMUX_EDITOR = os.environ.get("LMUX_EDITOR") or os.environ.get("EDITOR") or "nvim"
+
+# Where the "Open project…" picker looks for project directories. Colon-
+# separated, expanded via ~. Default matches the tmux-sessionizer layout.
+PROJECT_ROOTS_DEFAULT = "~/Projects:~/Work"
+
 # Where the auto-generated `claude` wrapper lives. Prepended to PATH for every
 # pane shell so `claude` inside lmux resolves to the wrapper, which then
 # injects Notification/Stop hooks via `--settings` before exec'ing the real
@@ -85,6 +93,35 @@ def _plain_title(decorated: str, is_claude: bool = False) -> str:
     if is_claude:
         return f"claude: {plain}" if plain else "claude"
     return plain or "shell"
+
+
+def list_project_dirs() -> list[tuple[str, str]]:
+    """Return [(basename, abspath), ...] for every immediate-child directory
+    under each configured project root. Sorted alphabetically; missing roots
+    are skipped silently.
+    """
+    roots = os.environ.get("LMUX_PROJECT_DIRS") or PROJECT_ROOTS_DEFAULT
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for raw in roots.split(":"):
+        root = os.path.expanduser(raw.strip())
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in entries:
+            if name.startswith("."):
+                continue
+            full = os.path.join(root, name)
+            if not os.path.isdir(full):
+                continue
+            if full in seen:
+                continue
+            seen.add(full)
+            out.append((name, full))
+    return out
 
 
 def _resolve_lmux_binary() -> str:
@@ -1342,18 +1379,23 @@ class Workspace:
     def tabs(self) -> list[TabRoot]:
         return list(self._tabs.keys())
 
-    def add_tab(self, cwd: str | None = None):
-        pane = self._make_pane(cwd=cwd)
+    def add_tab(self, cwd: str | None = None, initial_command: str | None = None,
+                custom_title: str | None = None, focus: bool = True):
+        pane = self._make_pane(cwd=cwd, initial_command=initial_command)
         tab_root = TabRoot(pane)
         tab_root.on_active_changed = self._on_active_changed
-        label = TabLabel(pane.title, on_close=lambda: self._close_tab(tab_root))
+        if custom_title:
+            tab_root.custom_title = custom_title
+        label = TabLabel(custom_title or pane.title,
+                         on_close=lambda: self._close_tab(tab_root))
         label.on_rename = lambda new: self._rename_tab(tab_root, new)
         self._tabs[tab_root] = label
         self._wire_pane(pane, tab_root)
         self.notebook.append_page(tab_root, label)
         self.notebook.set_tab_reorderable(tab_root, True)
-        self.notebook.set_current_page(self.notebook.get_n_pages() - 1)
-        GLib.idle_add(pane.focus_term)
+        if focus:
+            self.notebook.set_current_page(self.notebook.get_n_pages() - 1)
+            GLib.idle_add(pane.focus_term)
 
     def _rename_tab(self, tab_root: TabRoot, new_title: str):
         tab_root.custom_title = new_title or None
@@ -1941,6 +1983,36 @@ class LmuxWindow(Gtk.ApplicationWindow):
         # Manual rename — locks the workspace name against further auto-updates.
         self._set_workspace_name(ws, new_name, mark_custom=True)
 
+    def open_project(self, path: str) -> None:
+        """tmux-sessionizer equivalent: if a workspace already exists for
+        this project, switch to it; otherwise create a fresh workspace at
+        the project root with an editor tab and a shell tab.
+        """
+        path = os.path.expanduser(path)
+        if not os.path.isdir(path):
+            dlog(f"open_project: not a directory: {path!r}")
+            return
+        name = os.path.basename(path.rstrip("/")) or path
+        # Switch to an existing workspace if its name matches the project.
+        for ws in self.workspaces:
+            if ws.name == name:
+                self.sidebar_list.select_row(self._rows[ws])
+                return
+        # Otherwise build a new workspace: editor tab first, shell tab second,
+        # editor focused. Mirrors tmux-sessionizer's window layout.
+        ws = self._make_workspace(name)
+        # _make_workspace created a default empty tab; replace it.
+        for tr in list(ws.tabs()):
+            ws._close_tab(tr)
+        ws.add_tab(cwd=path, initial_command=LMUX_EDITOR, custom_title="editor", focus=True)
+        ws.add_tab(cwd=path, custom_title="shell", focus=False)
+        # Re-focus the editor tab — add_tab(focus=False) for shell already
+        # leaves editor as current_page, but be explicit.
+        ws.notebook.set_current_page(0)
+        first = ws.current_pane()
+        if first is not None:
+            GLib.idle_add(first.focus_term)
+
     def _set_workspace_name(self, ws: Workspace, new_name: str, *, mark_custom: bool):
         new_name = (new_name or "").strip()
         if not new_name:
@@ -2253,6 +2325,11 @@ class LmuxWindow(Gtk.ApplicationWindow):
         add("rename-workspace", self._rename_current_workspace, [], "Rename current workspace")
 
         add("command-palette", self._open_palette, ["<Ctrl><Shift>p"], "Command palette…")
+        add("open-project", self.open_project_picker, ["<Ctrl><Shift>o"], "Open project…")
+        # No default internal bind — Ctrl+Shift+F is taken by search. Trigger
+        # via the command palette, or bind Super+O at WM level to `lmux
+        # switch-workspace` to match the tmux-session-picker UX.
+        add("switch-workspace", self.switch_workspace_picker, [], "Switch workspace…")
 
     def _new_tab(self):
         ws = self._current_workspace()
@@ -2549,6 +2626,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
 
         self._palette_entries: list[tuple[str, str, object]] = []  # (label, accel_text, callback)
         self._palette_query: str = ""
+        self._palette_mode: str = "all"  # "all" | "projects" | "workspaces"
 
     def _palette_is_open(self) -> bool:
         return self.palette_root.get_parent() is not None
@@ -2564,17 +2642,34 @@ class LmuxWindow(Gtk.ApplicationWindow):
             return Gtk.accelerator_get_label(res[1], res[2])
         return ""
 
-    def _open_palette(self):
-        if self._palette_is_open():
+    def _open_palette(self, mode: str = "all"):
+        # When already open in a different mode, rebuild rather than no-op
+        # so a CLI invocation can switch from the full command list to the
+        # project picker without forcing the user to close first.
+        if self._palette_is_open() and self._palette_mode == mode:
             self.palette_entry.grab_focus()
             return
+        self._palette_mode = mode
         self._rebuild_palette_entries()
         self.palette_entry.set_text("")
         self._palette_query = ""
         self.palette_list.invalidate_filter()
         self._palette_select_first_visible()
-        self.overlay.add_overlay(self.palette_root)
+        if not self._palette_is_open():
+            self.overlay.add_overlay(self.palette_root)
+        # Placeholder text hints the mode.
+        hint = {
+            "projects": "open project…",
+            "workspaces": "switch workspace…",
+        }.get(mode, "type a command…")
+        self.palette_entry.set_placeholder_text(hint)
         GLib.idle_add(self.palette_entry.grab_focus)
+
+    def open_project_picker(self):
+        self._open_palette(mode="projects")
+
+    def switch_workspace_picker(self):
+        self._open_palette(mode="workspaces")
 
     def _close_palette(self):
         if not self._palette_is_open():
@@ -2594,31 +2689,45 @@ class LmuxWindow(Gtk.ApplicationWindow):
     def _rebuild_palette_entries(self):
         entries: list[tuple[str, str, object]] = []
 
-        # Static actions from the catalog.
-        for label, name, accels, in_palette in self._action_catalog:
-            if not in_palette:
-                continue
-            accel_text = self._format_accel(accels[0]) if accels else ""
-            entries.append((label, accel_text, lambda n=name: self.activate_action(n, None)))
+        mode = self._palette_mode
+        cur_ws = self._current_workspace()
+
+        # Static actions from the catalog (only in "all" mode).
+        if mode == "all":
+            for label, name, accels, in_palette in self._action_catalog:
+                if not in_palette:
+                    continue
+                accel_text = self._format_accel(accels[0]) if accels else ""
+                entries.append((label, accel_text,
+                                lambda n=name: self.activate_action(n, None)))
 
         # Dynamic: workspaces.
-        cur_ws = self._current_workspace()
-        for ws in self.workspaces:
-            marker = "  ●" if ws is cur_ws else ""
-            entries.append((f"Go to workspace: {ws.name}{marker}", "",
-                            lambda w=ws: self._palette_goto_workspace(w)))
+        if mode in ("all", "workspaces"):
+            for ws in self.workspaces:
+                marker = "  ●" if ws is cur_ws else ""
+                entries.append((f"Go to workspace: {ws.name}{marker}", "",
+                                lambda w=ws: self._palette_goto_workspace(w)))
 
         # Dynamic: tabs in current workspace.
-        if cur_ws is not None:
+        if mode == "all" and cur_ws is not None:
             for ti in range(cur_ws.notebook.get_n_pages()):
                 tab = cur_ws.notebook.get_nth_page(ti)
                 if not isinstance(tab, TabRoot):
                     continue
                 lbl = cur_ws._tabs.get(tab)
-                title_text = lbl.label.get_text() if lbl else cur_ws._label_title(tab, tab.active_pane)
+                title_text = (lbl.label.get_text() if lbl
+                              else cur_ws._label_title(tab, tab.active_pane))
                 marker = "  ●" if ti == cur_ws.notebook.get_current_page() else ""
                 entries.append((f"Go to tab: {title_text}{marker}", "",
                                 lambda i=ti: self._palette_goto_tab(i)))
+
+        # Dynamic: projects.
+        if mode == "projects":
+            open_ws_names = {w.name for w in self.workspaces}
+            for name, path in list_project_dirs():
+                marker = "  ●" if name in open_ws_names else ""
+                entries.append((f"{name}{marker}", path,
+                                lambda p=path: self._palette_open_project(p)))
 
         self._palette_entries = entries
 
@@ -2760,6 +2869,9 @@ class LmuxWindow(Gtk.ApplicationWindow):
         ws = self._current_workspace()
         if ws is not None:
             ws.select_tab(idx)
+
+    def _palette_open_project(self, path: str):
+        self.open_project(path)
 
     def _on_search_mode_changed(self, *_):
         if not self.search_bar.get_search_mode():
@@ -3062,6 +3174,9 @@ class LmuxApp(Gtk.Application):
             ("notify", self._on_notify_action),
             ("claude-session", self._on_claude_session_action),
             ("prompt-submit", self._on_prompt_submit_action),
+            ("open-project", self._on_open_project_action),
+            ("open-project-picker", self._on_open_project_picker_action),
+            ("switch-workspace-picker", self._on_switch_workspace_picker_action),
         ):
             act = Gio.SimpleAction.new(name, GLib.VariantType.new("a{sv}"))
             act.connect("activate", handler)
@@ -3093,6 +3208,30 @@ class LmuxApp(Gtk.Application):
         d = param.unpack() if param is not None else {}
         pane_id = d.get("pane_id")
         win.prompt_submit(str(pane_id) if pane_id else None)
+
+    def _on_open_project_action(self, _act, param):
+        win = self.get_active_window()
+        if win is None:
+            return
+        d = param.unpack() if param is not None else {}
+        path = d.get("path")
+        if path:
+            win.present()
+            win.open_project(str(path))
+
+    def _on_open_project_picker_action(self, _act, _param):
+        win = self.get_active_window()
+        if win is None:
+            return
+        win.present()
+        win.open_project_picker()
+
+    def _on_switch_workspace_picker_action(self, _act, _param):
+        win = self.get_active_window()
+        if win is None:
+            return
+        win.present()
+        win.switch_workspace_picker()
 
     def do_activate(self):
         install_claude_wrapper()
@@ -3220,10 +3359,46 @@ def _cli_prompt_submit(args: list[str]) -> int:
     return 0
 
 
+def _cli_open_project(args: list[str]) -> int:
+    flags, rc = _parse_kv_args(args, {"--path"})
+    if rc:
+        return rc
+    if "__help" in flags:
+        sys.stdout.write(
+            "usage: lmux open-project [--path PATH]\n"
+            "\n"
+            "With --path: create-or-switch a workspace for that project\n"
+            "directly (editor + shell tabs).\n"
+            "Without --path: open the fuzzy project picker in the running\n"
+            "lmux. Search roots come from $LMUX_PROJECT_DIRS\n"
+            f"(default: {PROJECT_ROOTS_DEFAULT}).\n"
+        )
+        return 0
+    path = flags.get("path")
+    if path:
+        _dbus_call_action("open-project", {"path": GLib.Variant("s", path)})
+    else:
+        _dbus_call_action("open-project-picker", {})
+    return 0
+
+
+def _cli_switch_workspace(args: list[str]) -> int:
+    flags, rc = _parse_kv_args(args, set())
+    if rc:
+        return rc
+    if "__help" in flags:
+        sys.stdout.write("usage: lmux switch-workspace\n")
+        return 0
+    _dbus_call_action("switch-workspace-picker", {})
+    return 0
+
+
 CLI_HANDLERS = {
     "notify": _cli_notify,
     "claude-session": _cli_claude_session,
     "prompt-submit": _cli_prompt_submit,
+    "open-project": _cli_open_project,
+    "switch-workspace": _cli_switch_workspace,
 }
 
 
