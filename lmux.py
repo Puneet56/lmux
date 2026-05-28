@@ -2325,11 +2325,13 @@ class LmuxWindow(Gtk.ApplicationWindow):
         add("rename-workspace", self._rename_current_workspace, [], "Rename current workspace")
 
         add("command-palette", self._open_palette, ["<Ctrl><Shift>p"], "Command palette…")
-        add("open-project", self.open_project_picker, ["<Ctrl><Shift>o"], "Open project…")
-        # No default internal bind — Ctrl+Shift+F is taken by search. Trigger
-        # via the command palette, or bind Super+O at WM level to `lmux
-        # switch-workspace` to match the tmux-session-picker UX.
-        add("switch-workspace", self.switch_workspace_picker, [], "Switch workspace…")
+        # Alt+Shift+F/O mirror the tmux-sessionizer / session-picker chords
+        # but at the GTK level so they only fire when lmux is focused —
+        # other apps still get their own Alt+Shift handlers.
+        add("open-project", self.open_project_picker,
+            ["<Alt><Shift>o", "<Ctrl><Shift>o"], "Open project…")
+        add("switch-workspace", self.switch_workspace_picker,
+            ["<Alt><Shift>f"], "Switch workspace…")
 
     def _new_tab(self):
         ws = self._current_workspace()
