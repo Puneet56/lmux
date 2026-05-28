@@ -409,13 +409,17 @@ def _session_of(pid: int) -> int | None:
         return None
 
 
-def _session_has_claude(sid: int) -> bool:
-    """Return True if any process in session `sid` has comm containing 'claude'."""
+def _session_has_comm(sid: int, *substrings: str) -> set[str]:
+    """Walk /proc, return the subset of `substrings` matched by any process
+    in session `sid`. One scan, multi-match — cheaper than re-walking per
+    program when we need both 'claude' and 'nvim' at save time.
+    """
     try:
         entries = os.listdir("/proc")
     except OSError:
-        return False
+        return set()
     sid_str = str(sid)
+    found: set[str] = set()
     for entry in entries:
         if not entry.isdigit():
             continue
@@ -433,9 +437,17 @@ def _session_has_claude(sid: int) -> bool:
         lp = stat.find("(")
         if lp == -1 or lp >= rp:
             continue
-        if "claude" in stat[lp + 1:rp]:
-            return True
-    return False
+        comm = stat[lp + 1:rp]
+        for s in substrings:
+            if s in comm:
+                found.add(s)
+        if len(found) == len(substrings):
+            break
+    return found
+
+
+def _session_has_claude(sid: int) -> bool:
+    return "claude" in _session_has_comm(sid, "claude")
 
 
 def git_branch(cwd: str | None) -> str | None:
@@ -498,6 +510,10 @@ class Pane(Gtk.Box):
         self._last_cursor_pos: tuple[int, int] = (-1, -1)
         self._last_branch: str | None = None
         self._is_claude: bool = False
+        # Authoritative-at-save-time flag, set by refresh_resume_markers().
+        # When True, the saved layout records this pane as an editor tab so
+        # restore re-spawns nvim.
+        self._is_editor: bool = False
         # Sticky: claude often spawns bash subprocesses to run tool calls, which
         # briefly steal the foreground process group. Without a hold window we'd
         # flip _is_claude off mid-conversation and miss the auto-resume on close.
@@ -647,8 +663,9 @@ class Pane(Gtk.Box):
         if self.cwd:
             base = os.path.basename(self.cwd.rstrip("/"))
         if self._is_claude:
-            # nf-md-robot prefix instead of "claude · "
-            return f"󰚩 {base}" if base else "󰚩 claude"
+            # Plain "claude:" prefix — Nerd Font glyphs squish or fall back
+            # to tofu boxes in GTK / mako / palette fonts inconsistently.
+            return f"claude: {base}" if base else "claude"
         if self._wm_title:
             return self._wm_title
         return base or "shell"
@@ -765,13 +782,13 @@ class Pane(Gtk.Box):
             GLib.source_remove(self._cwd_poll_id)
             self._cwd_poll_id = None
 
-    def refresh_claude_marker(self) -> None:
-        """Authoritative claude check via session scan.
+    def refresh_resume_markers(self) -> None:
+        """Authoritative check via /proc session scan: sets _is_claude and
+        _is_editor based on what's actually running in the pty's session.
 
-        Foreground-pgrp polling can miss claude if a tool-call bash happened to
-        be foreground at every poll within the sticky window. Scan all
-        processes in the pty's session at save time so any claude in the
-        session — even backgrounded behind a transient bash — is captured.
+        Foreground-pgrp polling can miss either program when a transient
+        bash holds the foreground (tool calls, :! escapes from nvim). One
+        full /proc walk at save time catches everything.
         """
         pty = self.term.get_pty()
         if pty is None:
@@ -788,12 +805,16 @@ class Pane(Gtk.Box):
         sid = _session_of(pgrp)
         if sid is None:
             return
-        found = _session_has_claude(sid)
-        dlog(f"refresh_claude_marker: sid={sid} session_has_claude={found} "
-             f"(was is_claude={self._is_claude})")
-        if found:
+        found = _session_has_comm(sid, "claude", "nvim")
+        dlog(f"refresh_resume_markers: sid={sid} found={found} "
+             f"(was is_claude={self._is_claude} is_editor={self._is_editor})")
+        if "claude" in found:
             self._is_claude = True
             self._claude_seen_mono = GLib.get_monotonic_time() / 1_000_000.0
+        self._is_editor = "nvim" in found
+
+    # Back-compat alias for any external callers.
+    refresh_claude_marker = refresh_resume_markers
 
     def _on_focus_enter(self, _ctrl):
         if self.on_focused:
@@ -1359,6 +1380,9 @@ class Workspace:
         # double-clicks-and-renames (or palette-renames), this flips to True
         # and we stop overwriting it on cwd changes.
         self.name_is_custom: bool = False
+        # Monotonic time of last activity (focus / sidebar select / current-
+        # pane-changed). Used to sort the workspace picker most-recent-first.
+        self.last_active_mono: float = GLib.get_monotonic_time() / 1_000_000.0
         self.on_empty = on_empty
         self.on_current_pane_changed = on_current_pane_changed
         self.on_pane_attention = on_pane_attention  # (ws, tab_root, pane, source)
@@ -1413,9 +1437,18 @@ class Workspace:
             t = node.get("type")
             if t == "pane":
                 was_claude = bool(node.get("claude"))
-                cmd = CLAUDE_RESUME_CMD if (was_claude and CLAUDE_RESUME_CMD) else None
+                was_editor = bool(node.get("editor"))
+                # Claude wins if both flags are set (a pane can't host both
+                # foreground programs simultaneously, but `was_claude` is the
+                # one we go out of our way to preserve via auto-resume).
+                if was_claude and CLAUDE_RESUME_CMD:
+                    cmd = CLAUDE_RESUME_CMD
+                elif was_editor:
+                    cmd = PROJECT_EDITOR_CMD
+                else:
+                    cmd = None
                 dlog(f"restore: pane cwd={node.get('cwd')!r} was_claude={was_claude} "
-                     f"queued_cmd={cmd!r}")
+                     f"was_editor={was_editor} queued_cmd={cmd!r}")
                 pane = self._make_pane(cwd=node.get("cwd"), initial_command=cmd)
                 collected.append((pane, bool(node.get("active")), None))
                 return pane
@@ -1634,6 +1667,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self._flash_target: "TabRoot | None" = None
         self._restoring: bool = False
         self._force_close: bool = False
+        self._last_bell_mono: float = 0.0
         self.theme = Theme(on_change=self._apply_theme_all)
 
         self.main_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -1698,12 +1732,14 @@ class LmuxWindow(Gtk.ApplicationWindow):
     def _serialize_layout(self, widget, active_pane):
         if isinstance(widget, Pane):
             dlog(f"save: pane cwd={widget.cwd!r} is_claude={widget._is_claude} "
+                 f"is_editor={widget._is_editor} "
                  f"last_seen_age={(GLib.get_monotonic_time()/1_000_000.0 - widget._claude_seen_mono):.1f}s")
             return {
                 "type": "pane",
                 "cwd": widget.cwd,
                 "active": widget is active_pane,
                 "claude": widget._is_claude,
+                "editor": widget._is_editor,
             }
         if isinstance(widget, Gtk.Paned):
             return {
@@ -1723,7 +1759,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         for ws in self.workspaces:
             for tr in ws.tabs():
                 for p in tr.panes():
-                    p.refresh_claude_marker()
+                    p.refresh_resume_markers()
         try:
             workspaces_data = []
             current_ws = self._current_workspace()
@@ -2080,6 +2116,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         if row is None:
             return
         ws: Workspace = row.workspace
+        ws.last_active_mono = GLib.get_monotonic_time() / 1_000_000.0
         self.stack.set_visible_child_name(ws.name)
         tr = ws.current_tab_root()
         if tr is not None:
@@ -2210,6 +2247,13 @@ class LmuxWindow(Gtk.ApplicationWindow):
         return False
 
     def _play_bell_sound(self):
+        # Throttle to 500 ms (seance-style) so N panes firing attention at
+        # the same moment don't spawn N concurrent canberra processes.
+        now_t = GLib.get_monotonic_time() / 1_000_000.0
+        if now_t - self._last_bell_mono < 0.5:
+            dlog(f"sound: throttled (last={now_t - self._last_bell_mono:.2f}s ago)")
+            return
+        self._last_bell_mono = now_t
         for argv in (
             ["canberra-gtk-play", "-i", "message-new-instant", "--description=lmux"],
             ["paplay", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"],
@@ -2705,9 +2749,17 @@ class LmuxWindow(Gtk.ApplicationWindow):
                 entries.append((label, accel_text,
                                 lambda n=name: self.activate_action(n, None)))
 
-        # Dynamic: workspaces.
+        # Dynamic: workspaces. In picker mode, most-recently-active first,
+        # current workspace moved to the bottom (tmux-session-picker style —
+        # you rarely want to switch to where you already are).
         if mode in ("all", "workspaces"):
-            for ws in self.workspaces:
+            ordered = list(self.workspaces)
+            if mode == "workspaces":
+                ordered.sort(key=lambda w: -w.last_active_mono)
+                if cur_ws in ordered:
+                    ordered.remove(cur_ws)
+                    ordered.append(cur_ws)
+            for ws in ordered:
                 marker = "  ●" if ws is cur_ws else ""
                 entries.append((f"Go to workspace: {ws.name}{marker}", "",
                                 lambda w=ws: self._palette_goto_workspace(w)))
@@ -3185,6 +3237,7 @@ class LmuxApp(Gtk.Application):
             ("prompt-submit", self._on_prompt_submit_action),
             ("open-project", self._on_open_project_action),
             ("open-project-picker", self._on_open_project_picker_action),
+            ("switch-workspace", self._on_switch_workspace_action),
             ("switch-workspace-picker", self._on_switch_workspace_picker_action),
             ("command-palette", self._on_command_palette_action),
         ):
@@ -3242,6 +3295,21 @@ class LmuxApp(Gtk.Application):
             return
         win.present()
         win.switch_workspace_picker()
+
+    def _on_switch_workspace_action(self, _act, param):
+        win = self.get_active_window()
+        if win is None:
+            return
+        d = param.unpack() if param is not None else {}
+        name = str(d.get("name", "") or "")
+        if not name:
+            return
+        win.present()
+        for ws in win.workspaces:
+            if ws.name == name:
+                win.sidebar_list.select_row(win._rows[ws])
+                return
+        dlog(f"switch-workspace: no workspace named {name!r}")
 
     def _on_command_palette_action(self, _act, _param):
         win = self.get_active_window()
@@ -3376,37 +3444,75 @@ def _cli_prompt_submit(args: list[str]) -> int:
     return 0
 
 
+def _split_flags_and_positional(
+    args: list[str], known_flags: set[str]
+) -> tuple[dict[str, str], list[str]]:
+    """Single-pass split: returns (flag_dict, [positional, ...]). Unknown
+    bare --flags are skipped (forward-compat with older wrappers).
+    """
+    flags: dict[str, str] = {}
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            flags["__help"] = "1"
+            return flags, positional
+        if a in known_flags and i + 1 < len(args):
+            flags[a.lstrip("-").replace("-", "_")] = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--"):
+            i += 1  # unknown bare flag, drop silently
+            continue
+        positional.append(a)
+        i += 1
+    return flags, positional
+
+
 def _cli_open_project(args: list[str]) -> int:
-    flags, rc = _parse_kv_args(args, {"--path"})
-    if rc:
-        return rc
+    flags, positional = _split_flags_and_positional(args, {"--path"})
     if "__help" in flags:
         sys.stdout.write(
-            "usage: lmux open-project [--path PATH]\n"
+            "usage: lmux open-project [BASENAME | --path PATH]\n"
             "\n"
-            "With --path: create-or-switch a workspace for that project\n"
-            "directly (editor + shell tabs).\n"
-            "Without --path: open the fuzzy project picker in the running\n"
-            "lmux. Search roots come from $LMUX_PROJECT_DIRS\n"
-            f"(default: {PROJECT_ROOTS_DEFAULT}).\n"
+            "BASENAME: look up under $LMUX_PROJECT_DIRS and open.\n"
+            "--path PATH: explicit absolute / ~-rooted path.\n"
+            "No args: open the fuzzy picker.\n"
+            f"Search roots default to {PROJECT_ROOTS_DEFAULT}.\n"
         )
         return 0
-    path = flags.get("path")
-    if path:
-        _dbus_call_action("open-project", {"path": GLib.Variant("s", path)})
+    target = flags.get("path")
+    if target is None and positional:
+        wanted = positional[0]
+        for name, full in list_project_dirs():
+            if name == wanted:
+                target = full
+                break
+        if target is None:
+            sys.stderr.write(f"lmux open-project: no project named {wanted!r}\n")
+            return 1
+    if target:
+        _dbus_call_action("open-project", {"path": GLib.Variant("s", target)})
     else:
         _dbus_call_action("open-project-picker", {})
     return 0
 
 
 def _cli_switch_workspace(args: list[str]) -> int:
-    flags, rc = _parse_kv_args(args, set())
-    if rc:
-        return rc
+    flags, positional = _split_flags_and_positional(args, set())
     if "__help" in flags:
-        sys.stdout.write("usage: lmux switch-workspace\n")
+        sys.stdout.write(
+            "usage: lmux switch-workspace [NAME]\n"
+            "\nNAME: switch directly to that workspace (no picker).\n"
+            "No args: open the workspace picker.\n"
+        )
         return 0
-    _dbus_call_action("switch-workspace-picker", {})
+    if positional:
+        _dbus_call_action("switch-workspace",
+                          {"name": GLib.Variant("s", positional[0])})
+    else:
+        _dbus_call_action("switch-workspace-picker", {})
     return 0
 
 

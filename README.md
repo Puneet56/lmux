@@ -2,7 +2,7 @@
 
 A minimal Linux take on [cmux](https://github.com/manaflow-ai/cmux)'s tab UI — vertical workspace sidebar + horizontal terminal tabs with splits.
 
-GTK4 + VTE + Python, single file (~700 lines). Built for running [Claude Code](https://docs.anthropic.com/en/docs/claude-code) agents in parallel without losing track of which one needs you.
+GTK4 + VTE + Python, single file. Built for running [Claude Code](https://docs.anthropic.com/en/docs/claude-code) agents in parallel without losing track of which one needs you.
 
 ![lmux screenshot](docs/screenshot.png)
 
@@ -14,15 +14,13 @@ GTK4 + VTE + Python, single file (~700 lines). Built for running [Claude Code](h
 - **Scrollback search** — `Ctrl+Shift+F` opens a search bar with a live hit count; Enter jumps to the previous (older) match, Shift+Enter to the next (newer), Esc closes
 - **Jump to next bell** — `Ctrl+Shift+J` cycles you to the next tab waiting on you, across workspaces
 - **Command palette** — `Ctrl+Shift+P` opens a fuzzy-searchable list of every action plus "Go to workspace…" / "Go to tab…" entries. Esc / click-outside closes
-- **Project picker (tmux-sessionizer style)** — `Alt+Shift+O` (or `Ctrl+Shift+O`, or `lmux open-project` from any shell) opens a fuzzy picker over directories under `~/Projects` and `~/Work`. Hitting Enter creates a new workspace named after the project with three tabs — **editor** (`nvim`, focused), **claude** (`claude --dangerously-skip-permissions`), and **shell** — or switches to an already-open workspace with that name. Override the search roots via `LMUX_PROJECT_DIRS=path1:path2`
-- **Workspace picker** — `Alt+Shift+F` (or `lmux switch-workspace`) opens the palette in workspace-only mode. Both binds are GTK-internal so they only intercept while lmux is the focused window — other apps' Alt+Shift handlers are untouched. Wire a WM-level bind to the CLI subcommand if you want a global trigger
-- **Persisted layout** — workspaces, tabs, splits, cwds, and custom titles are saved on window close to `~/.cache/lmux/state.json` and restored on next launch
+- **Project picker (tmux-sessionizer style)** — `Alt+Shift+O` (or `Ctrl+Shift+O`, or `lmux open-project [basename]` from any shell) opens a fuzzy picker over directories under `~/Projects` and `~/Work`. Hitting Enter creates a new workspace named after the project with three tabs — **editor** (`nvim`, focused), **claude** (`claude --dangerously-skip-permissions`), and **shell** — or switches to an already-open workspace with that name. Override the search roots via `LMUX_PROJECT_DIRS=path1:path2`. Pass a `basename` positional to skip the picker
+- **Workspace picker** — `Alt+Shift+F` (or `lmux switch-workspace [name]`) opens the palette in workspace-only mode, sorted most-recently-active first with the current workspace at the bottom (tmux-session-picker behavior). Both internal binds are GTK-level so they only fire while lmux is the focused window. Pass a `name` positional to switch directly
+- **Persisted layout** — workspaces, tabs, splits, cwds, and custom titles are saved on window close to `~/.cache/lmux/state.json` and restored on next launch. Editor (`nvim`) and claude tabs in a project workspace are detected via `/proc` session scan at save time and re-spawned automatically on restore
 - **Claude session auto-resume** — panes that had `claude` as their foreground process at save time are restored with `claude --continue --dangerously-skip-permissions` typed in automatically, so you land back in your conversation. Override the command via `LMUX_CLAUDE_RESUME_CMD=...`; set it to empty to disable
-- **Explicit-trigger notifications** (cmux-style) — no idle heuristics or terminal scraping. Two channels:
-  - **VTE BEL (`\a`)** — gated on `/proc/<fg-pgrp>/comm` containing `claude`, so shell tab-completion bells stay quiet.
-  - **OSC 777** — anything that prints `\033]777;notify;TITLE;BODY\033\\` to a pane's tty fires an attention event. The `lmux notify` CLI is a thin wrapper that writes exactly that, so it auto-targets the pane it ran in.
-- **Audible bell** (`message-new-instant.oga` via `canberra-gtk-play`) + **counted badge on tab and sidebar row** + **mako desktop toast** + **bouncy tab flash** — toast suppressed when the ringing pane is focused-here; sound + flash + count always fire
-- **Debug logging** — `LMUX_DEBUG=1 ./lmux.py 2>/tmp/lmux.log` prints breadcrumbs at every step of the bell + idle pipeline (signal received → gate check → window handler → sound spawn → toast send)
+- **Notifications via DBus, routed per pane** (cmux-style) — every pane gets a `LMUX_PANE_ID` UUID exposed to its shell env. Claude Code hooks (`Notification`, `Stop`, `SessionStart`, `SessionEnd`, `UserPromptSubmit`) call back via the `lmux` CLI subcommands (`notify`, `claude-session`, `prompt-submit`), which dispatch through the session bus to the running lmux's `notify`/`claude-session`/`prompt-submit` actions — landing on the exact pane claude is running in. No OSC parsing, no terminal scraping, no idle heuristics. Hooks are wired by an auto-installed `~/.cache/lmux/bin/claude` wrapper (see the Claude Code section below)
+- **Audible bell** (`message-new-instant.oga` via `canberra-gtk-play`, 500 ms throttle) + **counted badge on tab and sidebar row** + **mako desktop toast** + **bouncy tab flash** — toast suppressed when the ringing pane is focused-here; sound + flash + count always fire (subject to the sound throttle when many panes ring at once)
+- **Debug logging** — `LMUX_DEBUG=1 ./lmux.py 2>/tmp/lmux.log` traces every step from VTE signal to action dispatch to UI update
 - **Sidebar metadata** — each workspace row shows its current pane's `cwd` and git branch (`.git/HEAD` walk, no subprocess). Branch changes (e.g. `git checkout`) are picked up live via 1.2 s poll without leaving the pane focused
 - **Live kitty theme reload** — reads `~/.config/kitty/kitty.conf` (resolving `include`), follows omarchy theme switches via a file monitor on `theme.name`
 - **Ctrl+click URLs** to open in `xdg-open`
@@ -71,22 +69,23 @@ Next launch of the desktop entry picks up the new code. Old stable windows keep 
 
 ## Claude Code setup
 
-**No configuration required.** lmux follows [cmux](https://github.com/manaflow-ai/cmux)'s notification model: a small shell wrapper at `~/.cache/lmux/bin/claude` (auto-installed on every launch) shadows the real `claude` binary inside lmux panes, and injects Notification/Stop hooks via Claude Code's `--settings` flag. Outside lmux panes the wrapper passes through unchanged, and `--settings` merges additively with your own `~/.claude/settings.json` so nothing in your config gets clobbered.
+**No configuration required.** lmux follows [cmux](https://github.com/manaflow-ai/cmux)'s notification model: a small bash wrapper at `~/.cache/lmux/bin/claude` (auto-installed on every launch) shadows the real `claude` binary inside lmux panes and injects five hooks via Claude Code's `--settings` flag. Outside lmux panes the wrapper passes through unchanged, and `--settings` merges additively with your own `~/.claude/settings.json` so nothing in your config gets clobbered.
 
-What this looks like end-to-end:
+End-to-end:
 
-1. lmux launches → writes `~/.cache/lmux/bin/claude` and prepends that dir to every pane shell's `PATH`. Sets `LMUX_PANE=1` so the wrapper knows it's inside lmux.
-2. You type `claude` in a pane → the wrapper resolves the real claude (walks PATH, skips its own dir), then `exec`s it with `--settings '{"hooks":{"Notification":[...],"Stop":[...]}}'`.
-3. Claude needs input (Notification) or finishes a turn (Stop) → fires its hook, which calls `lmux notify --title Claude --body "..."`.
-4. `lmux notify` detects it's running in a Claude Code hook context (stdin is not a tty — Claude Code v2.1.139+ strips `/dev/tty` from hooks) and emits `{"terminalSequence": "\033]777;notify;...\033\\"}` to stdout. Claude relays that OSC 777 through its own pty, where VTE catches it and lmux fires the attention pipeline on that exact pane.
+1. lmux launches → writes `~/.cache/lmux/bin/claude` and prepends that dir to every pane shell's `PATH`. Each pane's shell env carries `LMUX_PANE_ID=<uuid>` so the wrapper (and the CLI it calls) can identify exactly which pane is asking.
+2. You type `claude` in a pane → the wrapper resolves the real claude (walks PATH, skips its own dir), then `exec`s it with `--settings '{"hooks":{...}}'` containing entries for **Notification**, **Stop**, **SessionStart**, **SessionEnd**, and **UserPromptSubmit**.
+3. Each hook command calls a lmux CLI subcommand:
+   - `Notification` → `lmux notify --title Claude --body "needs input"` — bell + badge + toast (if not focused).
+   - `Stop` → `lmux notify --title Claude --body done` — same.
+   - `SessionStart` → `lmux claude-session --state started` — marks the pane authoritatively as claude-running (tab title gains the `claude:` prefix, save-time auto-resume becomes reliable).
+   - `SessionEnd` → `lmux claude-session --state ended` — clears the marker.
+   - `UserPromptSubmit` → `lmux prompt-submit` — clears the pane's unread badge (you're at the keyboard, so there's nothing left to flag).
+4. Every CLI subcommand reads `$LMUX_PANE_ID` from the inherited env and dispatches via DBus to the running lmux's app-level action (`notify`, `claude-session`, `prompt-submit`). The action handler looks the pane up by id and runs the in-app pipeline on the exact pane claude is running in.
 
-Run `lmux notify --title Test --body hi` from anywhere — inside a pane shell, inside a claude session, even from another terminal window. The CLI tries three paths in order:
+Manual testing: `lmux notify --title Test --body hi` from any shell (inside or outside lmux). The CLI just dispatches via DBus — there's no OSC 777 or `/dev/tty` path involved (VTE 0.84 stopped recognizing OSC 777 anyway).
 
-1. `/dev/tty` — direct OSC 777 write. Works in regular interactive shells, auto-targets the calling pane.
-2. **DBus** — fires the `notify` action on the running `lmux` over the session bus. Lands on the focused pane. Used when `/dev/tty` is unavailable (e.g. inside a claude subprocess).
-3. `terminalSequence` JSON — last resort; only useful when relayed by a Claude Code hook handler.
-
-Hooks installed by the wrapper pass `--from-hook` to skip straight to path 3, so the hook-relay path and the DBus path don't double-fire.
+If lmux isn't running when a hook fires, the CLI exits 0 silently — the hook doesn't fail and claude doesn't penalize it.
 
 ## Keymap
 
@@ -116,6 +115,38 @@ Hooks installed by the wrapper pass `--from-hook` to skip straight to path 3, so
 | Double-click tab title / sidebar name | Rename (Enter commits, Esc cancels) |
 | `Ctrl+click` URL | Open in `xdg-open` |
 
+## CLI
+
+`lmux` doubles as a small DBus client. All subcommands dispatch to the running lmux's `org.gtk.Actions` interface:
+
+| Subcommand | Action |
+|---|---|
+| `lmux notify --title T --body B [--pane-id ID]` | Fire an attention event on a pane (defaults to `$LMUX_PANE_ID`) |
+| `lmux claude-session --state started\|ended [--pane-id ID]` | Mark the pane as claude-running (used by the SessionStart/SessionEnd hooks) |
+| `lmux prompt-submit [--pane-id ID]` | Clear the pane's unread badge (UserPromptSubmit hook) |
+| `lmux open-project [BASENAME \| --path PATH]` | Open / switch to a project workspace. No args opens the picker |
+| `lmux switch-workspace [NAME]` | Switch to a workspace by name. No args opens the picker |
+| `lmux command-palette` | Open the command palette |
+
+The CLI exits 0 silently if lmux isn't running — safe to call from Claude Code hooks without breaking the session.
+
+## Recommended WM binds (Hyprland example)
+
+```ini
+# Lmux pickers — focused or not
+bindd = SUPER, P, Lmux command palette, exec, lmux command-palette
+bindd = SUPER ALT, F, Lmux workspace picker, exec, lmux switch-workspace
+bindd = SUPER ALT, O, Lmux project picker, exec, lmux open-project
+
+# Cross-app tab convention — Super+T / Super+W act like browser/editor tab ops
+unbind = SUPER, T
+unbind = SUPER, W
+bindd = SUPER, T, New tab, sendshortcut, CTRL, T, activewindow
+bindd = SUPER, W, Close tab, sendshortcut, CTRL, W, activewindow
+```
+
+If you also use tmux, a small `lmux-or-tmux-popup` wrapper script that picks the lmux CLI when an lmux window is focused (and falls through to `tmux display-popup ... tmux-sessionizer` otherwise) keeps both workflows on the same keys.
+
 ## Theme honored from kitty.conf
 
 `font_family`, `font_size`, `foreground`, `background`, `cursor`, `cursor_text_color`, `cursor_shape`, `cursor_blink_interval`, `selection_foreground`, `selection_background`, `color0`–`color15`, `enable_audio_bell`. Anything kitty-only (font ligatures, `tab_bar_style`, hyperlinks-as-buttons) is silently ignored — VTE doesn't support those.
@@ -127,7 +158,7 @@ cmux is the real product. lmux is a thin Linux take on the tab UI + Claude bell.
 - In-app browser, SSH workspaces, Claude Teams orchestration
 - Notification panel, focus history with preview, persistent closed-item history
 - PR status / listening-port scanner in the sidebar
-- A scriptable API
+- The full cmux JSON-RPC over a Unix socket — lmux's CLI is a small DBus dispatcher, not a generic API
 
 ## License
 
