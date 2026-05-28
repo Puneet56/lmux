@@ -1792,6 +1792,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
                 "window": {"width": width, "height": height},
                 "active_workspace_index": active_ws_index,
                 "workspaces": workspaces_data,
+                "closed_cwds": list(self._closed_cwds),
             }
             os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
             tmp = STATE_PATH + ".tmp"
@@ -1848,7 +1849,12 @@ class LmuxWindow(Gtk.ApplicationWindow):
             row = self.sidebar_list.get_row_at_index(active_idx)
             if row is not None:
                 self.sidebar_list.select_row(row)
-        dlog(f"state restored: {len(self.workspaces)} workspaces")
+        # Replay the closed-tab history so Ctrl+Shift+Z works across restarts.
+        for cwd in (data.get("closed_cwds") or [])[-CLOSED_TAB_HISTORY:]:
+            if isinstance(cwd, str) and cwd:
+                self._closed_cwds.append(cwd)
+        dlog(f"state restored: {len(self.workspaces)} workspaces, "
+             f"{len(self._closed_cwds)} closed-tab entries")
         return True
 
     def _on_close_request(self, _w) -> bool:
