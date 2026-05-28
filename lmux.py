@@ -837,12 +837,7 @@ class TabLabel(Gtk.Box):
         if n <= 0:
             self.badge.set_visible(False)
             return
-        if n == 1:
-            self.badge.set_text("")  # nf-fa-bell
-        elif n > 99:
-            self.badge.set_text("99+")
-        else:
-            self.badge.set_text(str(n))
+        self.badge.set_text("99+" if n > 99 else str(n))
         self.badge.set_visible(True)
 
     def set_pane_count(self, n: int):
@@ -1056,12 +1051,7 @@ class WorkspaceRow(Gtk.ListBoxRow):
         if n <= 0:
             self.badge.set_visible(False)
             return
-        if n == 1:
-            self.badge.set_text("")  # nf-fa-bell
-        elif n > 99:
-            self.badge.set_text("99+")
-        else:
-            self.badge.set_text(str(n))
+        self.badge.set_text("99+" if n > 99 else str(n))
         self.badge.set_visible(True)
 
 
