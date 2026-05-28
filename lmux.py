@@ -1940,14 +1940,19 @@ class LmuxWindow(Gtk.ApplicationWindow):
     ):
         focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
         dlog(f"window bell: ws={ws.name} focused_here={focused_here}")
+        # Always fire the three "interrupt me" signals — even when this is the
+        # focused pane — so the user gets consistent feedback regardless of
+        # which window/tab they happen to be looking at.
         self._play_bell_sound()
+        self._send_desktop_notification(ws, pane, summary, body)
+        self._flash_window()
+        # Persistent marker dots are only useful when the user isn't already
+        # looking at the pane in question.
         if not focused_here:
             ws.mark_bell(tab_root)
             row = self._rows.get(ws)
             if row is not None:
                 row.set_notification(True)
-            self._send_desktop_notification(ws, pane, summary, body)
-            self._flash_window()
 
     def _on_bell_cleared(self, ws: Workspace):
         dlog(f"bell cleared on ws={ws.name} has_bell={ws.has_bell()}")
@@ -1979,16 +1984,17 @@ class LmuxWindow(Gtk.ApplicationWindow):
     def _on_idle(self, ws: Workspace, tab_root: TabRoot, pane: Pane):
         focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
         dlog(f"window idle: ws={ws.name} focused_here={focused_here}")
-        if focused_here:
-            return
+        # Always fire sound/notification/flash so the user gets the same
+        # "claude is waiting" feedback whether or not they're on this pane.
         self._play_bell_sound()
-        ws.mark_bell(tab_root)
-        row = self._rows.get(ws)
-        if row is not None:
-            row.set_notification(True)
         body = pane._recent_output_snippet()
         self._send_desktop_notification(ws, pane, "Claude is waiting", body)
         self._flash_window()
+        if not focused_here:
+            ws.mark_bell(tab_root)
+            row = self._rows.get(ws)
+            if row is not None:
+                row.set_notification(True)
 
     def _play_bell_sound(self):
         for argv in (
