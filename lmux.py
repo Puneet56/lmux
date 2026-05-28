@@ -539,7 +539,24 @@ class Pane(Gtk.Box):
             return None
         if not text:
             return None
-        chrome_prefixes = ("❯", "⏵", "◉", "←", "✻", "✶", "✢", "✽", "✸", "✼", "*")
+        chrome_prefixes = (
+            "❯", "⏵", "◉", "←", "✻", "✶", "✢", "✽", "✸", "✼", "*",
+            # Claude Code UI chrome.
+            "Tip:",     # "Tip: Use /permissions to pre-approve…"
+            "…",        # "… +17 lines (ctrl+o to expand)" collapse marker
+            "+",        # "+17 lines" without ellipsis
+            ">",        # quoted prompts / multi-line markers
+        )
+        # Substring tests for lines that don't have a tell-tale prefix but
+        # are still claude chrome / status — most importantly the thinking
+        # status line: "Metamorphosing… (10s · ↓ 262 tokens · still thinking)"
+        chrome_substrings = (
+            "(ctrl+o to",
+            "(ctrl-o to",
+            "ctrl+o to expand",
+            "still thinking",
+            "esc to interrupt",
+        )
         out: list[str] = []
         for raw in reversed(text.splitlines()):
             ln = raw.strip()
@@ -550,6 +567,13 @@ class Pane(Gtk.Box):
                 continue
             if ln.startswith(chrome_prefixes):
                 continue
+            if any(s in ln for s in chrome_substrings):
+                continue
+            # Token-usage status: "<verb>… (Ns · ↓ N tokens ...)". Detect via
+            # the unicode down-arrow + "tokens" pair, which appears in every
+            # variation of claude's thinking line.
+            if "↓" in ln and "tokens" in ln:
+                continue
             # Strip leading bullet glyphs claude uses for tool results / assistant turns
             for b in ("● ", "⎿ ", "⎿  "):
                 if ln.startswith(b):
@@ -558,7 +582,7 @@ class Pane(Gtk.Box):
             if not ln:
                 continue
             out.append(ln)
-            if len(out) >= 4:
+            if len(out) >= 3:
                 break
         if not out:
             return None
