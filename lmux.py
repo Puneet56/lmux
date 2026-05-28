@@ -266,6 +266,10 @@ class Pane(Gtk.Box):
         self._last_cursor_pos: tuple[int, int] = (-1, -1)
         self._last_branch: str | None = None
         self._is_claude: bool = False
+        # Sticky: claude often spawns bash subprocesses to run tool calls, which
+        # briefly steal the foreground process group. Without a hold window we'd
+        # flip _is_claude off mid-conversation and miss the auto-resume on close.
+        self._claude_seen_mono: float = 0.0
         self._pending_command: str | None = initial_command or None
 
         self.term.connect("window-title-changed", self._on_wm_title)
@@ -383,12 +387,21 @@ class Pane(Gtk.Box):
         branch_changed = br != self._last_branch
         if branch_changed:
             self._last_branch = br
-        # Claude detection — `comm` of the foreground process group.
+        # Claude detection — `comm` of the foreground process group, plus a
+        # short sticky window so brief tool-call subprocesses (bash) don't
+        # flip the flag off mid-conversation.
         try:
             with open(f"/proc/{pgrp}/comm") as f:
-                is_claude = "claude" in f.read()
+                fg_is_claude = "claude" in f.read()
         except OSError:
-            is_claude = False
+            fg_is_claude = False
+        now_t = GLib.get_monotonic_time() / 1_000_000.0
+        if fg_is_claude:
+            self._claude_seen_mono = now_t
+            is_claude = True
+        else:
+            # Hold for 30s after last seeing claude as foreground.
+            is_claude = (now_t - self._claude_seen_mono) < 30.0 if self._claude_seen_mono else False
         claude_changed = is_claude != self._is_claude
         if claude_changed:
             self._is_claude = is_claude
