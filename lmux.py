@@ -2719,8 +2719,13 @@ class LmuxWindow(Gtk.ApplicationWindow):
                 if not isinstance(tab, TabRoot):
                     continue
                 lbl = cur_ws._tabs.get(tab)
-                title_text = (lbl.label.get_text() if lbl
-                              else cur_ws._label_title(tab, tab.active_pane))
+                raw_title = (lbl.label.get_text() if lbl
+                             else cur_ws._label_title(tab, tab.active_pane))
+                # Strip Nerd Font glyphs — GTK's palette label font often
+                # lacks proper metrics for the robot/bell codepoints, which
+                # eats the trailing space and squishes the text.
+                is_claude = (tab.active_pane is not None and tab.active_pane._is_claude)
+                title_text = _plain_title(raw_title, is_claude=is_claude)
                 marker = "  ●" if ti == cur_ws.notebook.get_current_page() else ""
                 entries.append((f"Go to tab: {title_text}{marker}", "",
                                 lambda i=ti: self._palette_goto_tab(i)))
