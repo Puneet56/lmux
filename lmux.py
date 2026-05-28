@@ -466,6 +466,80 @@ def _session_has_claude(sid: int) -> bool:
     return "claude" in _session_has_comm(sid, "claude")
 
 
+def _list_pids_in_session(sid: int) -> list[int]:
+    """All pids whose session id matches sid."""
+    out: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out
+    sid_str = str(sid)
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        rp = stat.rfind(")")
+        if rp == -1:
+            continue
+        fields = stat[rp + 1:].split()
+        if len(fields) >= 4 and fields[3] == sid_str:
+            try:
+                out.append(int(entry))
+            except ValueError:
+                continue
+    return out
+
+
+def _socket_inodes_of(pid: int) -> set[int]:
+    """Inodes of all socket FDs held by a single pid."""
+    out: set[int] = set()
+    try:
+        entries = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return out
+    for fd in entries:
+        try:
+            link = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if link.startswith("socket:["):
+            try:
+                out.add(int(link[len("socket:["):-1]))
+            except ValueError:
+                continue
+    return out
+
+
+def _listen_sockets() -> dict[int, int]:
+    """Map of {inode: tcp_port} for every LISTEN socket on the host (v4+v6)."""
+    out: dict[int, int] = {}
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                f.readline()  # header
+                for line in f:
+                    fields = line.split()
+                    if len(fields) < 10:
+                        continue
+                    # state column: "0A" == TCP_LISTEN
+                    if fields[3] != "0A":
+                        continue
+                    try:
+                        port = int(fields[1].split(":")[1], 16)
+                        inode = int(fields[9])
+                    except (ValueError, IndexError):
+                        continue
+                    if inode > 0 and port > 0:
+                        out[inode] = port
+        except OSError:
+            continue
+    return out
+
+
 def git_branch(cwd: str | None) -> str | None:
     if not cwd:
         return None
@@ -993,6 +1067,15 @@ class WorkspaceRow(Gtk.ListBoxRow):
         self.sub_label.add_css_class("lmux-ws-sub")
         text.append(self.sub_label)
 
+        # Listening ports detected on any pane in this workspace's session(s).
+        self.ports_label = Gtk.Label(label="")
+        self.ports_label.set_xalign(0)
+        self.ports_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.ports_label.add_css_class("lmux-ws-ports")
+        self.ports_label.set_visible(False)
+        text.append(self.ports_label)
+        self._last_ports: frozenset[int] = frozenset()
+
         outer.append(text)
 
         # Attention badge mirroring TabLabel's: bell glyph for 1, count for 2+.
@@ -1128,6 +1211,23 @@ class WorkspaceRow(Gtk.ListBoxRow):
             return
         self.badge.set_text("99+" if n > 99 else str(n))
         self.badge.set_visible(True)
+
+    def set_ports(self, ports: set[int]):
+        frozen = frozenset(ports)
+        if frozen == self._last_ports:
+            return
+        self._last_ports = frozen
+        if not frozen:
+            self.ports_label.set_visible(False)
+            self.ports_label.set_text("")
+            return
+        # Numerically sorted; cap to keep the row from getting absurd.
+        listed = sorted(frozen)[:8]
+        text = "  ".join(f":{p}" for p in listed)
+        if len(frozen) > len(listed):
+            text += f"  +{len(frozen) - len(listed)}"
+        self.ports_label.set_text(text)
+        self.ports_label.set_visible(True)
 
 
 _SVG_SPLIT_RIGHT = b"""<?xml version="1.0"?>
@@ -1685,6 +1785,8 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self._force_close: bool = False
         self._last_bell_mono: float = 0.0
         self._notifications: deque[NotificationRecord] = deque(maxlen=100)
+        # Refreshed by _poll_ports; keeps sidebar port chips up to date.
+        self._ports_poll_id: int | None = None
         self.theme = Theme(on_change=self._apply_theme_all)
 
         self.main_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -1737,6 +1839,9 @@ class LmuxWindow(Gtk.ApplicationWindow):
         # After init/restore, make sure typing goes straight to the active pane —
         # the focus chain through Overlay + Stack + Notebook doesn't always pick it.
         GLib.idle_add(self._focus_current_pane)
+        # Start polling listening ports per workspace.
+        self._ports_poll_id = GLib.timeout_add_seconds(3, self._poll_ports)
+        GLib.idle_add(self._poll_ports)
 
     def _focus_current_pane(self) -> bool:
         ws = self._current_workspace()
@@ -1886,6 +1991,9 @@ class LmuxWindow(Gtk.ApplicationWindow):
         if self._flash_tick_id is not None:
             GLib.source_remove(self._flash_tick_id)
             self._flash_tick_id = None
+        if self._ports_poll_id is not None:
+            GLib.source_remove(self._ports_poll_id)
+            self._ports_poll_id = None
         # Drop every pane's timer refs so the Vte widgets can be released and
         # the GLib main loop has no remaining sources keeping the process alive.
         for ws in self.workspaces:
@@ -2152,6 +2260,47 @@ class LmuxWindow(Gtk.ApplicationWindow):
             return
         row.set_metadata(pane.cwd, git_branch(pane.cwd))
         row.set_unread(ws.unread_total())
+
+    def _ports_for_workspace(self, ws: Workspace, listen: dict[int, int]) -> set[int]:
+        """Aggregate the TCP LISTEN ports owned by any pane in this workspace.
+
+        `listen` is the `{inode: port}` map from _listen_sockets(); pass it
+        in once per poll cycle to avoid re-reading /proc/net/tcp per row.
+        """
+        if not listen:
+            return set()
+        ports: set[int] = set()
+        listen_inodes = listen.keys()
+        for tr in ws.tabs():
+            for p in tr.panes():
+                pty = p.term.get_pty()
+                if pty is None:
+                    continue
+                fd = pty.get_fd()
+                if fd < 0:
+                    continue
+                try:
+                    pgrp = os.tcgetpgrp(fd)
+                except OSError:
+                    continue
+                if pgrp <= 0:
+                    continue
+                sid = _session_of(pgrp)
+                if sid is None:
+                    continue
+                for pid in _list_pids_in_session(sid):
+                    for inode in _socket_inodes_of(pid) & listen_inodes:
+                        ports.add(listen[inode])
+        return ports
+
+    def _poll_ports(self) -> bool:
+        listen = _listen_sockets()
+        for ws in self.workspaces:
+            row = self._rows.get(ws)
+            if row is None:
+                continue
+            row.set_ports(self._ports_for_workspace(ws, listen))
+        return True  # keep the timer alive
 
     def _on_current_pane_changed(self, ws: Workspace, pane: Pane):
         # Auto-derive workspace name from the active pane's cwd unless the
@@ -3115,6 +3264,13 @@ notebook header tab label {
 .lmux-ws-sub {
     opacity: 0.55;
     font-size: 0.78em;
+    margin-top: 1px;
+}
+.lmux-ws-ports {
+    font-family: monospace;
+    font-size: 0.74em;
+    color: #4c8bf2;
+    opacity: 0.85;
     margin-top: 1px;
 }
 .lmux-ws-entry {
