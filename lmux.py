@@ -271,6 +271,8 @@ class Pane(Gtk.Box):
         # flip _is_claude off mid-conversation and miss the auto-resume on close.
         self._claude_seen_mono: float = 0.0
         self._pending_command: str | None = initial_command or None
+        if self._pending_command:
+            dlog(f"Pane init: queued initial_command={self._pending_command!r}")
 
         self.term.connect("window-title-changed", self._on_wm_title)
         self.term.connect("current-directory-uri-changed", self._on_cwd_uri)
@@ -392,9 +394,10 @@ class Pane(Gtk.Box):
         # flip the flag off mid-conversation.
         try:
             with open(f"/proc/{pgrp}/comm") as f:
-                fg_is_claude = "claude" in f.read()
+                fg_comm = f.read().strip()
         except OSError:
-            fg_is_claude = False
+            fg_comm = ""
+        fg_is_claude = "claude" in fg_comm
         now_t = GLib.get_monotonic_time() / 1_000_000.0
         if fg_is_claude:
             self._claude_seen_mono = now_t
@@ -405,6 +408,7 @@ class Pane(Gtk.Box):
         claude_changed = is_claude != self._is_claude
         if claude_changed:
             self._is_claude = is_claude
+            dlog(f"pane claude flag: fg_comm={fg_comm!r} fg_is_claude={fg_is_claude} -> is_claude={is_claude}")
         if (cwd_changed or branch_changed or claude_changed) and self.on_changed:
             self.on_changed(self)
         return True
@@ -532,9 +536,11 @@ class Pane(Gtk.Box):
         if self._pending_command:
             cmd = self._pending_command
             self._pending_command = None
+            dlog(f"first-output trigger: feeding {cmd!r} to child")
             def _feed():
                 try:
                     self.term.feed_child((cmd + "\n").encode())
+                    dlog("feed_child OK")
                 except Exception as e:
                     dlog(f"feed_child failed: {e}")
                 return False
@@ -1196,6 +1202,8 @@ class Workspace:
             if t == "pane":
                 was_claude = bool(node.get("claude"))
                 cmd = CLAUDE_RESUME_CMD if (was_claude and CLAUDE_RESUME_CMD) else None
+                dlog(f"restore: pane cwd={node.get('cwd')!r} was_claude={was_claude} "
+                     f"queued_cmd={cmd!r}")
                 pane = self._make_pane(cwd=node.get("cwd"), initial_command=cmd)
                 collected.append((pane, bool(node.get("active")), None))
                 return pane
@@ -1484,6 +1492,8 @@ class LmuxWindow(Gtk.ApplicationWindow):
 
     def _serialize_layout(self, widget, active_pane):
         if isinstance(widget, Pane):
+            dlog(f"save: pane cwd={widget.cwd!r} is_claude={widget._is_claude} "
+                 f"last_seen_age={(GLib.get_monotonic_time()/1_000_000.0 - widget._claude_seen_mono):.1f}s")
             return {
                 "type": "pane",
                 "cwd": widget.cwd,
