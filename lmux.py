@@ -1921,7 +1921,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
     def new_workspace(self):
         self._make_workspace(None)
 
-    def _make_workspace(self, name: str | None) -> Workspace:
+    def _make_workspace(self, name: str | None, *, with_default_tab: bool = True) -> Workspace:
         auto_name = name is None
         if auto_name:
             self._ws_counter += 1
@@ -1964,8 +1964,9 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self.sidebar_list.select_row(row)
 
         # Default new workspace starts with one fresh tab. Callers restoring
-        # from state add their own tabs after creation.
-        if not self._restoring:
+        # from state, or constructing a multi-tab workspace (e.g. the project
+        # picker's editor + shell layout), pass with_default_tab=False.
+        if with_default_tab and not self._restoring:
             ws.add_tab()
 
         pane = ws.current_pane()
@@ -2000,14 +2001,9 @@ class LmuxWindow(Gtk.ApplicationWindow):
                 return
         # Otherwise build a new workspace: editor tab first, shell tab second,
         # editor focused. Mirrors tmux-sessionizer's window layout.
-        ws = self._make_workspace(name)
-        # _make_workspace created a default empty tab; replace it.
-        for tr in list(ws.tabs()):
-            ws._close_tab(tr)
+        ws = self._make_workspace(name, with_default_tab=False)
         ws.add_tab(cwd=path, initial_command=LMUX_EDITOR, custom_title="editor", focus=True)
         ws.add_tab(cwd=path, custom_title="shell", focus=False)
-        # Re-focus the editor tab — add_tab(focus=False) for shell already
-        # leaves editor as current_page, but be explicit.
         ws.notebook.set_current_page(0)
         first = ws.current_pane()
         if first is not None:
