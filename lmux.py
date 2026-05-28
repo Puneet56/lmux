@@ -9,8 +9,10 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
 from collections import deque
+from dataclasses import dataclass, field
 from urllib.parse import unquote, urlparse
 
 import gi
@@ -71,6 +73,20 @@ LMUX_BIN_DIR = os.path.expanduser("~/.cache/lmux/bin")
 def dlog(*args):
     if DEBUG:
         print("[lmux]", *args, file=sys.stderr, flush=True)
+
+
+@dataclass
+class NotificationRecord:
+    """One entry in the lmux notifications panel ring buffer."""
+    when: float  # unix timestamp (seconds)
+    ws_name: str
+    tab_title: str
+    pane_id: str
+    title: str
+    body: str
+
+    def fmt_time(self) -> str:
+        return time.strftime("%H:%M", time.localtime(self.when))
 
 
 def _strip_nerd_glyphs(s: str) -> str:
@@ -1668,6 +1684,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self._restoring: bool = False
         self._force_close: bool = False
         self._last_bell_mono: float = 0.0
+        self._notifications: deque[NotificationRecord] = deque(maxlen=100)
         self.theme = Theme(on_change=self._apply_theme_all)
 
         self.main_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -2159,9 +2176,11 @@ class LmuxWindow(Gtk.ApplicationWindow):
         for ws in self.workspaces:
             ws.apply_theme(cfg)
 
-    def _notify(self, ws: Workspace, tab_root: TabRoot, pane: Pane, source: str):
+    def _notify(self, ws: Workspace, tab_root: TabRoot, pane: Pane, source: str,
+                title: str = "lmux", body: str = ""):
         """Fire attention for a pane: sound + flash + unread bump, plus a
-        desktop toast when the pane isn't currently focused.
+        desktop toast when the pane isn't currently focused. Every fire
+        also lands in the notifications ring buffer.
         """
         focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
         dlog(f"notify: ws={ws.name} source={source} focused_here={focused_here}")
@@ -2173,6 +2192,18 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self._flash_tab(tab_root)
         if not focused_here:
             self._send_desktop_notification(ws, tab_root, pane)
+        # Record in the panel ring buffer using the same plain-text formatting
+        # as the desktop toast so the panel stays in sync.
+        tab_title = _plain_title(ws._label_title(tab_root, pane),
+                                 is_claude=pane._is_claude)
+        self._notifications.append(NotificationRecord(
+            when=time.time(),
+            ws_name=ws.name,
+            tab_title=tab_title,
+            pane_id=getattr(pane, "pane_id", ""),
+            title=title,
+            body=body,
+        ))
 
     def cli_notify(self, title: str, body: str, pane_id: str | None = None) -> None:
         """DBus `notify` entry. Routes to the pane named by pane_id, or
@@ -2183,7 +2214,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
             dlog(f"cli_notify: no pane (pane_id={pane_id!r})")
             return
         ws, tr, pane = target
-        self._notify(ws, tr, pane, "cli")
+        self._notify(ws, tr, pane, "cli", title=title, body=body)
 
     def claude_session(self, pane_id: str | None, state: str) -> None:
         """DBus `claude-session` entry. SessionStart/SessionEnd hooks call
@@ -2384,6 +2415,8 @@ class LmuxWindow(Gtk.ApplicationWindow):
             ["<Alt><Shift>o", "<Ctrl><Shift>o"], "Open project…")
         add("switch-workspace", self.switch_workspace_picker,
             ["<Alt><Shift>f"], "Switch workspace…")
+        add("notifications-panel", self.open_notifications_panel,
+            ["<Ctrl><Shift>i"], "Notifications…")
 
     def _new_tab(self):
         ws = self._current_workspace()
@@ -2715,6 +2748,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         hint = {
             "projects": "open project…",
             "workspaces": "switch workspace…",
+            "notifications": "filter notifications…",
         }.get(mode, "type a command…")
         self.palette_entry.set_placeholder_text(hint)
         GLib.idle_add(self.palette_entry.grab_focus)
@@ -2724,6 +2758,28 @@ class LmuxWindow(Gtk.ApplicationWindow):
 
     def switch_workspace_picker(self):
         self._open_palette(mode="workspaces")
+
+    def open_notifications_panel(self):
+        self._open_palette(mode="notifications")
+
+    def _jump_to_pane(self, pane_id: str):
+        """Switch to whichever workspace/tab contains pane_id and focus
+        the pane. Used by notification-panel rows."""
+        if not pane_id:
+            return
+        for ws in self.workspaces:
+            for tr in ws.tabs():
+                for p in tr.panes():
+                    if getattr(p, "pane_id", None) == pane_id:
+                        row = self._rows.get(ws)
+                        if row is not None:
+                            self.sidebar_list.select_row(row)
+                        idx = ws.notebook.page_num(tr)
+                        if idx >= 0:
+                            ws.notebook.set_current_page(idx)
+                        GLib.idle_add(p.focus_term)
+                        return
+        dlog(f"jump-to-pane: pane_id={pane_id!r} not found (pane closed?)")
 
     def _close_palette(self):
         if not self._palette_is_open():
@@ -2795,6 +2851,20 @@ class LmuxWindow(Gtk.ApplicationWindow):
                 marker = "  ●" if name in open_ws_names else ""
                 entries.append((f"{name}{marker}", path,
                                 lambda p=path: self._palette_open_project(p)))
+
+        # Dynamic: notifications. Newest first; clicking jumps to the
+        # pane that fired the event (resolved by pane_id at click time so
+        # workspace/tab moves since the event still land correctly).
+        if mode == "notifications":
+            if not self._notifications:
+                entries.append(("No notifications yet.", "", lambda: None))
+            else:
+                for rec in reversed(self._notifications):
+                    body_part = f" — {rec.body}" if rec.body else ""
+                    label = (f"{rec.fmt_time()}  {rec.ws_name} · "
+                             f"{rec.tab_title}{body_part}")
+                    entries.append((label, "",
+                                    lambda pid=rec.pane_id: self._jump_to_pane(pid)))
 
         self._palette_entries = entries
 
@@ -3246,6 +3316,7 @@ class LmuxApp(Gtk.Application):
             ("switch-workspace", self._on_switch_workspace_action),
             ("switch-workspace-picker", self._on_switch_workspace_picker_action),
             ("command-palette", self._on_command_palette_action),
+            ("notifications-panel", self._on_notifications_panel_action),
         ):
             act = Gio.SimpleAction.new(name, GLib.VariantType.new("a{sv}"))
             act.connect("activate", handler)
@@ -3323,6 +3394,13 @@ class LmuxApp(Gtk.Application):
             return
         win.present()
         win._open_palette()
+
+    def _on_notifications_panel_action(self, _act, _param):
+        win = self.get_active_window()
+        if win is None:
+            return
+        win.present()
+        win.open_notifications_panel()
 
     def do_activate(self):
         install_claude_wrapper()
@@ -3533,6 +3611,17 @@ def _cli_command_palette(args: list[str]) -> int:
     return 0
 
 
+def _cli_notifications(args: list[str]) -> int:
+    flags, rc = _parse_kv_args(args, set())
+    if rc:
+        return rc
+    if "__help" in flags:
+        sys.stdout.write("usage: lmux notifications\n")
+        return 0
+    _dbus_call_action("notifications-panel", {})
+    return 0
+
+
 CLI_HANDLERS = {
     "notify": _cli_notify,
     "claude-session": _cli_claude_session,
@@ -3540,6 +3629,7 @@ CLI_HANDLERS = {
     "open-project": _cli_open_project,
     "switch-workspace": _cli_switch_workspace,
     "command-palette": _cli_command_palette,
+    "notifications": _cli_notifications,
 }
 
 
