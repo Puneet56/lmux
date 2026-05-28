@@ -3181,6 +3181,7 @@ class LmuxApp(Gtk.Application):
             ("open-project", self._on_open_project_action),
             ("open-project-picker", self._on_open_project_picker_action),
             ("switch-workspace-picker", self._on_switch_workspace_picker_action),
+            ("command-palette", self._on_command_palette_action),
         ):
             act = Gio.SimpleAction.new(name, GLib.VariantType.new("a{sv}"))
             act.connect("activate", handler)
@@ -3236,6 +3237,13 @@ class LmuxApp(Gtk.Application):
             return
         win.present()
         win.switch_workspace_picker()
+
+    def _on_command_palette_action(self, _act, _param):
+        win = self.get_active_window()
+        if win is None:
+            return
+        win.present()
+        win._open_palette()
 
     def do_activate(self):
         install_claude_wrapper()
@@ -3397,12 +3405,24 @@ def _cli_switch_workspace(args: list[str]) -> int:
     return 0
 
 
+def _cli_command_palette(args: list[str]) -> int:
+    flags, rc = _parse_kv_args(args, set())
+    if rc:
+        return rc
+    if "__help" in flags:
+        sys.stdout.write("usage: lmux command-palette\n")
+        return 0
+    _dbus_call_action("command-palette", {})
+    return 0
+
+
 CLI_HANDLERS = {
     "notify": _cli_notify,
     "claude-session": _cli_claude_session,
     "prompt-submit": _cli_prompt_submit,
     "open-project": _cli_open_project,
     "switch-workspace": _cli_switch_workspace,
+    "command-palette": _cli_command_palette,
 }
 
 
