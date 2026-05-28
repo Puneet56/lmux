@@ -469,7 +469,8 @@ class Pane(Gtk.Box):
         if self.cwd:
             base = os.path.basename(self.cwd.rstrip("/"))
         if self._is_claude:
-            return f"claude · {base}" if base else "claude"
+            # nf-md-robot prefix instead of "claude · "
+            return f"󰚩 {base}" if base else "󰚩 claude"
         if self._wm_title:
             return self._wm_title
         return base or "shell"
@@ -696,7 +697,7 @@ class TabLabel(Gtk.Box):
 
     def __init__(self, title: str, on_close):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        self.dot = Gtk.Label(label="●")
+        self.dot = Gtk.Label(label="")  # nf-fa-bell
         self.dot.add_css_class("lmux-bell")
         self.dot.set_visible(False)
         self.append(self.dot)
@@ -719,8 +720,7 @@ class TabLabel(Gtk.Box):
         self.count_badge.set_visible(False)
         self.append(self.count_badge)
 
-        self.close_btn = Gtk.Button()
-        self.close_btn.set_icon_name("window-close-symbolic")
+        self.close_btn = Gtk.Button(label="")  # nf-fa-times
         self.close_btn.add_css_class("lmux-tab-close")
         self.close_btn.add_css_class("flat")
         self.close_btn.set_valign(Gtk.Align.CENTER)
@@ -831,14 +831,13 @@ class WorkspaceRow(Gtk.ListBoxRow):
 
         outer.append(text)
 
-        self.chip = Gtk.Label(label="READY")
+        self.chip = Gtk.Label(label="")  # nf-fa-bell
         self.chip.add_css_class("lmux-chip-ready")
         self.chip.set_visible(False)
         self.chip.set_valign(Gtk.Align.CENTER)
         outer.append(self.chip)
 
-        self.close_btn = Gtk.Button()
-        self.close_btn.set_icon_name("window-close-symbolic")
+        self.close_btn = Gtk.Button(label="")  # nf-fa-times
         self.close_btn.add_css_class("lmux-ws-close")
         self.close_btn.add_css_class("flat")
         self.close_btn.set_valign(Gtk.Align.CENTER)
@@ -2623,7 +2622,7 @@ CSS = b"""
 /* ---- accents ----------------------------------------------------------- */
 .lmux-bell {
     color: #4c8bf2;
-    font-size: 0.65em;
+    font-size: 0.85em;
     margin: 0 2px 0 0;
 }
 .lmux-active-pane { box-shadow: inset 0 0 0 1px #4c8bf2; }
@@ -2744,11 +2743,9 @@ CSS = b"""
 .lmux-chip-ready {
     background-color: #4c8bf2;
     color: #ffffff;
-    font-size: 0.62em;
-    font-weight: 700;
-    padding: 1px 6px;
+    font-size: 0.78em;
+    padding: 2px 6px;
     border-radius: 3px;
-    letter-spacing: 0.06em;
 }
 
 .lmux-split-count {
@@ -2764,10 +2761,11 @@ CSS = b"""
 /* ---- close buttons (x) on tabs and sidebar rows ----------------------- */
 .lmux-tab-close,
 .lmux-ws-close {
-    min-width: 18px;
-    min-height: 18px;
-    padding: 0;
+    min-width: 16px;
+    min-height: 16px;
+    padding: 0 4px;
     margin: 0 0 0 4px;
+    font-size: 0.82em;
     background: transparent;
     border: none;
     color: alpha(currentColor, 0.35);
