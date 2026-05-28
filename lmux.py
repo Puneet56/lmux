@@ -86,13 +86,13 @@ def _claude_wrapper_script() -> str:
     this only adds our Notification/Stop hooks — user config stays intact.
     """
     lmux_bin = _resolve_lmux_binary()
-    # Hook commands invoke `lmux notify`. When the user's `lmux` resolves
-    # via PATH inside the claude subprocess we'd be fine, but pinning the
-    # absolute path here makes the hook robust to PATH oddities.
+    # Hook commands invoke `lmux notify --from-hook`. The flag short-
+    # circuits the /dev/tty + DBus fallback paths so we only emit the
+    # terminalSequence JSON that claude relays — no duplicate firing.
     notif_cmd = (
-        f'{lmux_bin} notify --title Claude --body \\"needs input\\"'
+        f'{lmux_bin} notify --from-hook --title Claude --body \\"needs input\\"'
     )
-    stop_cmd = f"{lmux_bin} notify --title Claude --body done"
+    stop_cmd = f"{lmux_bin} notify --from-hook --title Claude --body done"
     hooks_json = (
         '{"hooks":{'
         '"Notification":[{"matcher":"","hooks":[{"type":"command","command":"'
@@ -2114,6 +2114,24 @@ class LmuxWindow(Gtk.ApplicationWindow):
         if not focused_here:
             self._send_desktop_notification(ws, tab_root, pane)
 
+    def cli_notify(self, title: str, body: str) -> None:
+        """Entry point for the DBus `notify` action — fires on the focused
+        pane of the current workspace. Used when `lmux notify` is invoked
+        from a context where /dev/tty isn't writable (e.g. claude's Bash
+        tool) and the hook-relay path doesn't apply either.
+        """
+        ws = self._current_workspace()
+        if ws is None:
+            dlog("cli_notify: no current workspace")
+            return
+        tr = ws.current_tab_root()
+        if tr is None or tr.active_pane is None:
+            dlog("cli_notify: no active pane")
+            return
+        pane = tr.active_pane
+        pane.last_notification = (body or title) or None
+        self._notify(ws, tr, pane, "cli")
+
     def _flash_tab(self, tab_root: "TabRoot | None"):
         if tab_root is None:
             return
@@ -3050,6 +3068,21 @@ paned > separator:active {
 class LmuxApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        # Exposed on the session bus via GApplication's standard
+        # /<APP_ID-as-path> object so `lmux notify` can call us as a
+        # fallback when /dev/tty / hook-relay paths don't apply.
+        notif_act = Gio.SimpleAction.new("notify", GLib.VariantType.new("a{sv}"))
+        notif_act.connect("activate", self._on_notify_action)
+        self.add_action(notif_act)
+
+    def _on_notify_action(self, _act, param):
+        win = self.get_active_window()
+        if win is None:
+            return
+        d = param.unpack() if param is not None else {}
+        title = str(d.get("title", "lmux") or "lmux")
+        body = str(d.get("body", "") or "")
+        win.cli_notify(title, body)
 
     def do_activate(self):
         install_claude_wrapper()
@@ -3066,33 +3099,73 @@ class LmuxApp(Gtk.Application):
         win.present()
 
 
+def _send_via_dbus(title: str, body: str) -> bool:
+    """Fire the `notify` action on the running LmuxApp over the session bus.
+
+    Returns True only if the call succeeded. Used as a fallback when
+    /dev/tty is unavailable and we're not in a hook-relay context.
+    """
+    try:
+        conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        if conn is None:
+            return False
+        obj_path = "/" + APP_ID.replace(".", "/")
+        payload = GLib.Variant("a{sv}", {
+            "title": GLib.Variant("s", title),
+            "body": GLib.Variant("s", body),
+        })
+        # org.gtk.Actions.Activate(s action, av params, a{sv} platform_data)
+        params = GLib.Variant("(sava{sv})", ("notify", [payload], {}))
+        conn.call_sync(
+            APP_ID,
+            obj_path,
+            "org.gtk.Actions",
+            "Activate",
+            params,
+            None,
+            Gio.DBusCallFlags.NONE,
+            2000,
+            None,
+        )
+        return True
+    except GLib.Error as e:
+        dlog(f"DBus notify failed: {e}")
+        return False
+
+
 def _cli_notify(args: list[str]) -> int:
     """Fire an attention event in the surrounding lmux pane.
 
-    Two contexts, two output paths:
-
-    - **Claude Code hook context** (stdin is not a tty — Claude Code v2.1.139+
-      runs hooks in their own session, `/dev/tty` is unavailable). Emit a
-      JSON `{"terminalSequence": "..."}` to stdout; Claude relays that OSC
-      777 sequence into its own pty, where VTE catches `notification-received`.
-    - **Interactive use** (stdin is a tty — you're testing from a shell
-      prompt). Write the OSC 777 directly to `/dev/tty`.
+    Dispatch order:
+      1. `--from-hook` (set by the wrapper for Claude Code hooks): emit
+         only `{"terminalSequence": ...}` JSON on stdout so claude relays
+         OSC 777 through its own pty, auto-targeting the claude pane.
+      2. Try `/dev/tty`: works for plain interactive shells inside an
+         lmux pane. OSC 777 lands directly in VTE.
+      3. DBus fallback: fire the `notify` action on the running LmuxApp.
+         Lands on the focused pane. Covers manual `lmux notify` from
+         contexts where /dev/tty is detached (claude's Bash tool, etc.).
+      4. Last resort: emit terminalSequence JSON anyway.
     """
     title = "lmux"
     body = ""
+    from_hook = False
     i = 0
     while i < len(args):
         a = args[i]
         if a in ("-h", "--help"):
             sys.stdout.write(
-                "usage: lmux notify [--title TITLE] [--body BODY]\n"
+                "usage: lmux notify [--title TITLE] [--body BODY] [--from-hook]\n"
                 "\n"
                 "Fires an attention event in the surrounding lmux pane.\n"
-                "When called from a Claude Code hook, emits a JSON\n"
-                "terminalSequence response; interactively, writes OSC 777\n"
-                "to /dev/tty directly.\n"
+                "  --from-hook  emit terminalSequence JSON only; used by the\n"
+                "               claude wrapper's injected Notification/Stop hooks\n"
             )
             return 0
+        if a == "--from-hook":
+            from_hook = True
+            i += 1
+            continue
         if a == "--title" and i + 1 < len(args):
             title = args[i + 1]
             i += 2
@@ -3105,27 +3178,29 @@ def _cli_notify(args: list[str]) -> int:
         return 2
 
     def _clean(s: str) -> str:
-        # OSC 777 uses ';' as a field separator; ESC/BEL end the sequence.
         return s.replace(";", " ").replace("\x1b", " ").replace("\x07", " ")
 
     title = _clean(title)
     body = _clean(body)
     seq = f"\x1b]777;notify;{title};{body}\x1b\\"
 
-    # Prefer writing OSC 777 to /dev/tty so the surrounding VTE catches it
-    # directly. This works for plain interactive shells inside an lmux pane.
-    # When invoked from a Claude Code hook (v2.1.139+ detaches the hook
-    # subprocess session, so /dev/tty fails with ENXIO), fall back to
-    # emitting `terminalSequence` JSON — Claude relays the escape through
-    # its own pty.
+    if from_hook:
+        sys.stdout.write(json.dumps({"terminalSequence": seq}) + "\n")
+        return 0
+
     try:
         with open("/dev/tty", "w") as tty:
             tty.write(seq)
             tty.flush()
         return 0
     except OSError:
-        sys.stdout.write(json.dumps({"terminalSequence": seq}) + "\n")
+        pass
+
+    if _send_via_dbus(title, body):
         return 0
+
+    sys.stdout.write(json.dumps({"terminalSequence": seq}) + "\n")
+    return 0
 
 
 def main() -> int:

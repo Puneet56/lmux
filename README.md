@@ -78,7 +78,13 @@ What this looks like end-to-end:
 3. Claude needs input (Notification) or finishes a turn (Stop) → fires its hook, which calls `lmux notify --title Claude --body "..."`.
 4. `lmux notify` detects it's running in a Claude Code hook context (stdin is not a tty — Claude Code v2.1.139+ strips `/dev/tty` from hooks) and emits `{"terminalSequence": "\033]777;notify;...\033\\"}` to stdout. Claude relays that OSC 777 through its own pty, where VTE catches it and lmux fires the attention pipeline on that exact pane.
 
-Run `lmux notify --title Test --body hi` from inside a pane to verify — you should hear the bell, see the tab badge bump, and (if focused elsewhere) get a desktop toast.
+Run `lmux notify --title Test --body hi` from anywhere — inside a pane shell, inside a claude session, even from another terminal window. The CLI tries three paths in order:
+
+1. `/dev/tty` — direct OSC 777 write. Works in regular interactive shells, auto-targets the calling pane.
+2. **DBus** — fires the `notify` action on the running `lmux` over the session bus. Lands on the focused pane. Used when `/dev/tty` is unavailable (e.g. inside a claude subprocess).
+3. `terminalSequence` JSON — last resort; only useful when relayed by a Claude Code hook handler.
+
+Hooks installed by the wrapper pass `--from-hook` to skip straight to path 3, so the hook-relay path and the DBus path don't double-fire.
 
 ## Keymap
 
