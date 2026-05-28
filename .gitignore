@@ -6,3 +6,4 @@ venv/
 cmux/
 .DS_Store
 *.swp
+seance/
