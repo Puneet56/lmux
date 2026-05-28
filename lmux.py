@@ -63,6 +63,22 @@ def dlog(*args):
         print("[lmux]", *args, file=sys.stderr, flush=True)
 
 
+# Forensic trace path. Writes a single line per call regardless of DEBUG /
+# stderr routing. Use only at the notification pipeline's choke points
+# (~10-20 lines per session). Path is fixed so testers can `tail -F` it.
+NOTIFY_TRACE_PATH = os.path.expanduser("~/.cache/lmux/notify-trace.log")
+
+
+def ntrace(*args):
+    try:
+        os.makedirs(os.path.dirname(NOTIFY_TRACE_PATH), exist_ok=True)
+        import time as _time
+        with open(NOTIFY_TRACE_PATH, "a") as f:
+            f.write(f"{_time.strftime('%H:%M:%S')} " + " ".join(str(a) for a in args) + "\n")
+    except Exception:
+        pass
+
+
 def _resolve_lmux_binary() -> str:
     """Absolute path to the running lmux binary, for embedding in hook
     commands. Prefer the running argv[0] so dev-mode runs route to the dev
@@ -744,6 +760,7 @@ class Pane(Gtk.Box):
         # OSC 777 is an explicit signal: someone (Claude Code hook, `lmux
         # notify`, a script) printed `\033]777;notify;...\033\\` to this pty.
         # Trust it — no gating, no debounce.
+        ntrace(f"pane._on_notification: summary={summary!r} body={body!r} has_on_attention={self.on_attention is not None}")
         dlog(f"vte notification-received summary={summary!r} body={body!r}")
         self.last_notification = body or summary or None
         if self.on_changed:
@@ -2102,17 +2119,28 @@ class LmuxWindow(Gtk.ApplicationWindow):
           - always: sound, pane flash, unread count++
           - if not focused-here: also fire the desktop toast
         """
-        focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
-        dlog(f"notify: ws={ws.name} source={source} focused_here={focused_here}")
-        pane.unread_count += 1
-        # Trigger label + row redraw via the existing on_changed path.
-        if pane.on_changed is not None:
-            pane.on_changed(pane)
-        self._refresh_row(ws, pane)
-        self._play_bell_sound()
-        self._flash_tab(tab_root)
-        if not focused_here:
-            self._send_desktop_notification(ws, tab_root, pane)
+        ntrace(f"_notify: ENTER ws={ws.name if ws else None} src={source}")
+        try:
+            focused_here = self._is_visible(ws, tab_root, pane) and self.is_active()
+            ntrace(f"_notify: focused_here={focused_here} active={self.is_active()}")
+            dlog(f"notify: ws={ws.name} source={source} focused_here={focused_here}")
+            pane.unread_count += 1
+            if pane.on_changed is not None:
+                pane.on_changed(pane)
+            ntrace("_notify: after on_changed")
+            self._refresh_row(ws, pane)
+            ntrace("_notify: after _refresh_row")
+            self._play_bell_sound()
+            ntrace("_notify: after _play_bell_sound")
+            self._flash_tab(tab_root)
+            ntrace("_notify: after _flash_tab")
+            if not focused_here:
+                self._send_desktop_notification(ws, tab_root, pane)
+                ntrace("_notify: after _send_desktop_notification")
+            ntrace("_notify: EXIT clean")
+        except Exception as e:
+            import traceback
+            ntrace(f"_notify: EXC {e!r}\n{traceback.format_exc()}")
 
     def cli_notify(self, title: str, body: str) -> None:
         """Entry point for the DBus `notify` action — fires on the focused
@@ -2120,16 +2148,21 @@ class LmuxWindow(Gtk.ApplicationWindow):
         from a context where /dev/tty isn't writable (e.g. claude's Bash
         tool) and the hook-relay path doesn't apply either.
         """
+        ntrace(f"cli_notify: ENTER title={title!r} body={body!r} workspaces={len(self.workspaces)}")
         ws = self._current_workspace()
         if ws is None:
-            dlog("cli_notify: no current workspace")
-            return
+            ntrace(f"cli_notify: _current_workspace returned None; falling back to first")
+            ws = self.workspaces[0] if self.workspaces else None
+            if ws is None:
+                ntrace("cli_notify: NO workspace at all, bailing")
+                return
         tr = ws.current_tab_root()
         if tr is None or tr.active_pane is None:
-            dlog("cli_notify: no active pane")
+            ntrace(f"cli_notify: no active pane (tr={tr})")
             return
         pane = tr.active_pane
         pane.last_notification = (body or title) or None
+        ntrace(f"cli_notify: calling _notify on ws={ws.name}")
         self._notify(ws, tr, pane, "cli")
 
     def _flash_tab(self, tab_root: "TabRoot | None"):
@@ -3076,13 +3109,20 @@ class LmuxApp(Gtk.Application):
         self.add_action(notif_act)
 
     def _on_notify_action(self, _act, param):
-        win = self.get_active_window()
-        if win is None:
-            return
-        d = param.unpack() if param is not None else {}
-        title = str(d.get("title", "lmux") or "lmux")
-        body = str(d.get("body", "") or "")
-        win.cli_notify(title, body)
+        ntrace(f"app._on_notify_action: param={param}")
+        try:
+            win = self.get_active_window()
+            if win is None:
+                ntrace("app._on_notify_action: no active window")
+                return
+            d = param.unpack() if param is not None else {}
+            title = str(d.get("title", "lmux") or "lmux")
+            body = str(d.get("body", "") or "")
+            ntrace(f"app._on_notify_action: dispatching title={title!r} body={body!r}")
+            win.cli_notify(title, body)
+        except Exception as e:
+            import traceback
+            ntrace(f"app._on_notify_action: EXC {e!r}\n{traceback.format_exc()}")
 
     def do_activate(self):
         install_claude_wrapper()
