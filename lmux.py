@@ -3120,7 +3120,12 @@ def _resolve_cli_pane_id(explicit: str | None) -> str | None:
 
 
 def _parse_kv_args(args: list[str], known_flags: set[str]) -> tuple[dict[str, str], int]:
-    """Tiny long-flag parser: returns ({flag: value}, exit_code_or_0)."""
+    """Tiny long-flag parser: returns ({flag: value}, exit_code_or_0).
+
+    Unknown bare flags (no value) are accepted silently so claude sessions
+    launched with an older wrapper (e.g. one that passed --from-hook) keep
+    working across an lmux upgrade.
+    """
     out: dict[str, str] = {}
     i = 0
     while i < len(args):
@@ -3131,6 +3136,10 @@ def _parse_kv_args(args: list[str], known_flags: set[str]) -> tuple[dict[str, st
         if a in known_flags and i + 1 < len(args):
             out[a.lstrip("-").replace("-", "_")] = args[i + 1]
             i += 2
+            continue
+        if a.startswith("--"):
+            # Skip unknown bare flag for forward/backward compat.
+            i += 1
             continue
         sys.stderr.write(f"unknown argument {a!r}\n")
         return out, 2
