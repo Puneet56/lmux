@@ -1884,8 +1884,13 @@ class LmuxWindow(Gtk.ApplicationWindow):
         add("zoom-out", lambda: self._zoom(-0.1), ["<Ctrl>minus"], "Zoom out")
         add("zoom-reset", self._zoom_reset, ["<Ctrl>0"], "Reset zoom")
 
-        add("copy", self._copy, ["<Ctrl><Shift>c"], "Copy")
-        add("paste", self._paste, ["<Ctrl><Shift>v"], "Paste")
+        # Insert-key bindings cover universal-paste shortcuts that desktop
+        # environments synthesize (omarchy's Super+V → Shift+Insert, Super+C →
+        # Ctrl+Insert). VTE's default Shift+Insert pastes from the X11 primary
+        # selection, which doesn't match what a clipboard-manager populated
+        # via Super+C left there — so route both through our clipboard paste.
+        add("copy", self._copy, ["<Ctrl><Shift>c", "<Ctrl>Insert"], "Copy")
+        add("paste", self._paste, ["<Ctrl><Shift>v", "<Shift>Insert"], "Paste")
 
         add("find", self._start_find, ["<Ctrl><Shift>f"], "Find in scrollback")
 
