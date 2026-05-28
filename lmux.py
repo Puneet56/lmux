@@ -1554,6 +1554,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
         self._flash_tick_id: int | None = None
         self._flash_target: "TabRoot | None" = None
         self._restoring: bool = False
+        self._force_close: bool = False
         self.theme = Theme(on_change=self._apply_theme_all)
 
         self.main_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -1736,6 +1737,13 @@ class LmuxWindow(Gtk.ApplicationWindow):
         return True
 
     def _on_close_request(self, _w) -> bool:
+        if self._force_close:
+            self._teardown_for_quit()
+            return False  # allow close
+        self._show_quit_confirmation()
+        return True  # block close until user confirms
+
+    def _teardown_for_quit(self):
         self._save_state()
         if self._flash_tick_id is not None:
             GLib.source_remove(self._flash_tick_id)
@@ -1749,7 +1757,37 @@ class LmuxWindow(Gtk.ApplicationWindow):
                         p.shutdown()
                     except Exception:
                         pass
-        return False  # allow close
+
+    def _show_quit_confirmation(self):
+        n_panes = 0
+        n_claude = 0
+        for ws in self.workspaces:
+            for tr in ws.tabs():
+                for p in tr.panes():
+                    n_panes += 1
+                    if p._is_claude:
+                        n_claude += 1
+        parts = [f"{n_panes} pane{'s' if n_panes != 1 else ''} open"]
+        if n_claude:
+            parts.append(f"{n_claude} running claude")
+        detail = " · ".join(parts) + "."
+        dialog = Gtk.AlertDialog()
+        dialog.set_modal(True)
+        dialog.set_message("Quit lmux?")
+        dialog.set_detail(detail)
+        dialog.set_buttons(["Cancel", "Quit"])
+        dialog.set_cancel_button(0)
+        dialog.set_default_button(0)
+        dialog.choose(self, None, self._on_quit_choice)
+
+    def _on_quit_choice(self, dialog, result):
+        try:
+            choice = dialog.choose_finish(result)
+        except GLib.Error:
+            return  # dismissed (Esc, etc.)
+        if choice == 1:
+            self._force_close = True
+            self.close()
 
     def _on_is_active_changed(self, *_):
         active = self.is_active()
