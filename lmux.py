@@ -45,6 +45,15 @@ try:
 except ValueError:
     CLAUDE_IDLE_SEC = 5.0
 
+# When a pane that was running `claude` is restored from state.json, lmux types
+# this command into the freshly-spawned shell so the conversation resumes.
+# Override via env if you don't want --dangerously-skip-permissions, or set
+# empty to disable auto-resume entirely.
+CLAUDE_RESUME_CMD = os.environ.get(
+    "LMUX_CLAUDE_RESUME_CMD",
+    "claude --continue --dangerously-skip-permissions",
+)
+
 
 def dlog(*args):
     if DEBUG:
@@ -225,6 +234,7 @@ class Pane(Gtk.Box):
         cwd: str | None = None,
         theme_cfg: dict[str, str] | None = None,
         font_scale: float = 1.0,
+        initial_command: str | None = None,
     ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.set_hexpand(True)
@@ -256,6 +266,7 @@ class Pane(Gtk.Box):
         self._last_cursor_pos: tuple[int, int] = (-1, -1)
         self._last_branch: str | None = None
         self._is_claude: bool = False
+        self._pending_command: str | None = initial_command or None
 
         self.term.connect("window-title-changed", self._on_wm_title)
         self.term.connect("current-directory-uri-changed", self._on_cwd_uri)
@@ -503,6 +514,18 @@ class Pane(Gtk.Box):
         self._notified_since_output = False
         if self._idle_tick_id is None and CLAUDE_IDLE_SEC > 0:
             self._idle_tick_id = GLib.timeout_add(1000, self._idle_tick)
+        # Inject the queued startup command (claude --continue ...) on first
+        # real shell output, when we know the prompt is up and reading stdin.
+        if self._pending_command:
+            cmd = self._pending_command
+            self._pending_command = None
+            def _feed():
+                try:
+                    self.term.feed_child((cmd + "\n").encode())
+                except Exception as e:
+                    dlog(f"feed_child failed: {e}")
+                return False
+            GLib.idle_add(_feed)
 
     def _idle_tick(self) -> bool:
         if not self.term.get_realized():
@@ -1158,7 +1181,9 @@ class Workspace:
         def build(node):
             t = node.get("type")
             if t == "pane":
-                pane = self._make_pane(cwd=node.get("cwd"))
+                was_claude = bool(node.get("claude"))
+                cmd = CLAUDE_RESUME_CMD if (was_claude and CLAUDE_RESUME_CMD) else None
+                pane = self._make_pane(cwd=node.get("cwd"), initial_command=cmd)
                 collected.append((pane, bool(node.get("active")), None))
                 return pane
             if t == "split":
@@ -1209,8 +1234,13 @@ class Workspace:
         self.notebook.set_tab_reorderable(tab_root, True)
         return True
 
-    def _make_pane(self, cwd: str | None = None) -> Pane:
-        return Pane(cwd=cwd, theme_cfg=self.theme_cfg, font_scale=self.font_scale)
+    def _make_pane(self, cwd: str | None = None, initial_command: str | None = None) -> Pane:
+        return Pane(
+            cwd=cwd,
+            theme_cfg=self.theme_cfg,
+            font_scale=self.font_scale,
+            initial_command=initial_command,
+        )
 
     def _wire_pane(self, pane: Pane, tab_root: TabRoot):
         def changed(p):
@@ -1445,6 +1475,7 @@ class LmuxWindow(Gtk.ApplicationWindow):
                 "type": "pane",
                 "cwd": widget.cwd,
                 "active": widget is active_pane,
+                "claude": widget._is_claude,
             }
         if isinstance(widget, Gtk.Paned):
             return {
