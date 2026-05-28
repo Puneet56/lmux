@@ -205,6 +205,56 @@ class Theme:
         return False
 
 
+def _session_of(pid: int) -> int | None:
+    """Read the session id of a process from /proc/<pid>/stat."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    # stat format: pid (comm) state ppid pgrp session ...
+    # comm can contain spaces and ')', so anchor on the LAST ')'.
+    rp = stat.rfind(")")
+    if rp == -1:
+        return None
+    fields = stat[rp + 1:].split()
+    if len(fields) < 4:
+        return None
+    try:
+        return int(fields[3])
+    except ValueError:
+        return None
+
+
+def _session_has_claude(sid: int) -> bool:
+    """Return True if any process in session `sid` has comm containing 'claude'."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    sid_str = str(sid)
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        rp = stat.rfind(")")
+        if rp == -1:
+            continue
+        fields = stat[rp + 1:].split()
+        if len(fields) < 4 or fields[3] != sid_str:
+            continue
+        lp = stat.find("(")
+        if lp == -1 or lp >= rp:
+            continue
+        if "claude" in stat[lp + 1:rp]:
+            return True
+    return False
+
+
 def git_branch(cwd: str | None) -> str | None:
     if not cwd:
         return None
@@ -592,6 +642,36 @@ class Pane(Gtk.Box):
         if self._idle_tick_id:
             GLib.source_remove(self._idle_tick_id)
             self._idle_tick_id = None
+
+    def refresh_claude_marker(self) -> None:
+        """Authoritative claude check via session scan.
+
+        Foreground-pgrp polling can miss claude if a tool-call bash happened to
+        be foreground at every poll within the sticky window. Scan all
+        processes in the pty's session at save time so any claude in the
+        session — even backgrounded behind a transient bash — is captured.
+        """
+        pty = self.term.get_pty()
+        if pty is None:
+            return
+        fd = pty.get_fd()
+        if fd < 0:
+            return
+        try:
+            pgrp = os.tcgetpgrp(fd)
+        except OSError:
+            return
+        if pgrp <= 0:
+            return
+        sid = _session_of(pgrp)
+        if sid is None:
+            return
+        found = _session_has_claude(sid)
+        dlog(f"refresh_claude_marker: sid={sid} session_has_claude={found} "
+             f"(was is_claude={self._is_claude})")
+        if found:
+            self._is_claude = True
+            self._claude_seen_mono = GLib.get_monotonic_time() / 1_000_000.0
 
     def _on_focus_enter(self, _ctrl):
         if self.on_focused:
@@ -1512,6 +1592,13 @@ class LmuxWindow(Gtk.ApplicationWindow):
         return None
 
     def _save_state(self) -> None:
+        # Authoritative pre-save refresh of each pane's claude marker via
+        # /proc session scan — so a transient bash subprocess at the moment
+        # of close doesn't mask a still-running claude.
+        for ws in self.workspaces:
+            for tr in ws.tabs():
+                for p in tr.panes():
+                    p.refresh_claude_marker()
         try:
             workspaces_data = []
             current_ws = self._current_workspace()
