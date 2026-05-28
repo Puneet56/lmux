@@ -949,9 +949,9 @@ class WorkspaceRow(Gtk.ListBoxRow):
     def set_metadata(self, cwd: str | None, branch: str | None):
         base = os.path.basename(cwd.rstrip("/")) if cwd else ""
         if base and branch:
-            self.sub_label.set_text(f"{base}  ⎇ {branch}")
+            self.sub_label.set_text(f"{base}   {branch}")
         elif branch:
-            self.sub_label.set_text(f"⎇ {branch}")
+            self.sub_label.set_text(f" {branch}")
         elif base:
             self.sub_label.set_text(base)
         else:
